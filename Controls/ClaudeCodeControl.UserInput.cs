@@ -77,6 +77,7 @@ namespace ClaudeCodeVS
 
             try
             {
+                string filesAndSelections = BuildOpenFilesAndSelectionContext();
                 string prompt = PromptTextBox.Text.Trim();
                 bool hasFiles = attachedImagePaths.Any();
 
@@ -156,6 +157,12 @@ namespace ClaudeCodeVS
                             }
                         }
                     }
+                    fullPrompt.AppendLine();
+                }
+
+                if (!string.IsNullOrEmpty(filesAndSelections))
+                {
+                    fullPrompt.AppendLine(filesAndSelections);
                     fullPrompt.AppendLine();
                 }
 
@@ -513,6 +520,62 @@ namespace ClaudeCodeVS
         #endregion
 
         #region Editor Selection Integration
+
+        /// <summary>
+        /// Builds prompt context containing all open file paths and the active editor selection.
+        /// </summary>
+        private string BuildOpenFilesAndSelectionContext()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            var dte = Package.GetGlobalService(typeof(EnvDTE.DTE)) as EnvDTE.DTE;
+            if (dte == null)
+            {
+                return string.Empty;
+            }
+
+            var sb = new StringBuilder();
+            var seenFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (EnvDTE.Document doc in dte.Documents)
+            {
+                if (doc?.ActiveWindow == null || string.IsNullOrEmpty(doc.FullName))
+                {
+                    continue;
+                }
+
+                string displayPath = doc.FullName;
+                if (!string.IsNullOrEmpty(_lastWorkspaceDirectory) &&
+                    displayPath.StartsWith(_lastWorkspaceDirectory, StringComparison.OrdinalIgnoreCase))
+                {
+                    displayPath = displayPath.Substring(_lastWorkspaceDirectory.Length).TrimStart('\\', '/');
+                }
+
+                if (seenFiles.Add(displayPath))
+                {
+                    if (sb.Length == 0)
+                    {
+                        sb.AppendLine("The prompt is mainly for the following files:");
+                    }
+
+                    sb.AppendLine($"  - {displayPath}");
+                }
+            }
+
+            var selection = dte.ActiveDocument?.Selection as EnvDTE.TextSelection;
+            if (selection != null && !string.IsNullOrEmpty(selection.Text))
+            {
+                if (sb.Length > 0)
+                {
+                    sb.AppendLine();
+                }
+
+                sb.AppendLine("and for the code:");
+                sb.AppendLine(selection.Text.TrimEnd('\r', '\n'));
+            }
+
+            return sb.ToString().TrimEnd();
+        }
 
         /// <summary>
         /// Language identifier mapping from file extensions to markdown code fence language IDs
