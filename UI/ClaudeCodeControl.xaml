@@ -124,6 +124,98 @@
 		<Style x:Key="IconButtonStyle" TargetType="Button" BasedOn="{StaticResource AdaptiveButtonStyle}">
 			<Setter Property="Opacity" Value="0.93"/>
 		</Style>
+
+		<!-- Icon CheckBox style (similar to IconButtonStyle but for CheckBoxes) -->
+		<Style x:Key="IconCheckBoxStyle" TargetType="CheckBox">
+			<Setter Property="Background" Value="{DynamicResource {x:Static vsshell:VsBrushes.ToolWindowBackgroundKey}}"/>
+			<Setter Property="Foreground" Value="{DynamicResource {x:Static vsshell:VsBrushes.ToolWindowTextKey}}"/>
+			<Setter Property="BorderBrush" Value="{DynamicResource {x:Static vsshell:VsBrushes.ToolWindowBorderKey}}"/>
+			<Setter Property="BorderThickness" Value="1"/>
+			<Setter Property="Width" Value="32"/>
+			<Setter Property="Height" Value="30"/>
+			<Setter Property="HorizontalContentAlignment" Value="Center"/>
+			<Setter Property="VerticalContentAlignment" Value="Center"/>
+			<Setter Property="Cursor" Value="Hand"/>
+			<Setter Property="Focusable" Value="False"/>
+			<Setter Property="SnapsToDevicePixels" Value="True"/>
+			<Setter Property="Opacity" Value="0.93"/>
+			<Setter Property="Template">
+				<Setter.Value>
+					<ControlTemplate TargetType="CheckBox">
+						<Border x:Name="ActionBorder"
+								Background="{TemplateBinding Background}"
+								BorderBrush="{TemplateBinding BorderBrush}"
+								BorderThickness="{TemplateBinding BorderThickness}"
+								CornerRadius="4">
+							<ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" 
+											  VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
+						</Border>
+						<ControlTemplate.Triggers>
+							<Trigger Property="IsMouseOver" Value="True">
+								<Setter TargetName="ActionBorder" Property="Background" Value="{DynamicResource {x:Static vsshell:VsBrushes.CommandBarHoverOverSelectedKey}}"/>
+								<Setter TargetName="ActionBorder" Property="BorderBrush" Value="{DynamicResource {x:Static vsshell:VsBrushes.CommandBarSelectedBorderKey}}"/>
+							</Trigger>
+							<Trigger Property="IsChecked" Value="True">
+								<Setter TargetName="ActionBorder" Property="Background" Value="{DynamicResource {x:Static vsshell:VsBrushes.CommandBarSelectedKey}}"/>
+								<Setter TargetName="ActionBorder" Property="BorderBrush" Value="{DynamicResource {x:Static vsshell:VsBrushes.CommandBarSelectedBorderKey}}"/>
+							</Trigger>
+							<Trigger Property="IsEnabled" Value="False">
+								<Setter TargetName="ActionBorder" Property="Background" Value="{DynamicResource {x:Static vsshell:VsBrushes.ToolWindowBackgroundKey}}"/>
+								<Setter Property="Foreground" Value="{DynamicResource {x:Static vsshell:VsBrushes.GrayTextKey}}"/>
+								<Setter TargetName="ActionBorder" Property="BorderBrush" Value="{DynamicResource {x:Static vsshell:VsBrushes.ToolWindowBorderKey}}"/>
+							</Trigger>
+						</ControlTemplate.Triggers>
+					</ControlTemplate>
+				</Setter.Value>
+			</Setter>
+		</Style>
+
+		<!-- Default CheckBox style (themed) -->
+		<Style TargetType="CheckBox">
+			<Setter Property="Background" Value="{DynamicResource {x:Static vsshell:VsBrushes.ToolWindowBackgroundKey}}"/>
+			<Setter Property="Foreground" Value="{DynamicResource {x:Static vsshell:VsBrushes.ToolWindowTextKey}}"/>
+			<Setter Property="VerticalContentAlignment" Value="Center"/>
+			<Setter Property="Padding" Value="6,0,0,0"/>
+			<Setter Property="Template">
+				<Setter.Value>
+					<ControlTemplate TargetType="CheckBox">
+						<BulletDecorator Background="Transparent" SnapsToDevicePixels="True">
+							<BulletDecorator.Bullet>
+								<Border x:Name="CheckBoxBorder"
+										Width="16" Height="16"
+										Background="{TemplateBinding Background}"
+										BorderBrush="{TemplateBinding Foreground}"
+										BorderThickness="1">
+									<Path x:Name="CheckMark"
+										  Data="M 3,8 L 6,11 L 13,3"
+										  Stroke="{TemplateBinding Foreground}"
+										  StrokeThickness="2"
+										  Visibility="Collapsed"
+										  SnapsToDevicePixels="False"/>
+								</Border>
+							</BulletDecorator.Bullet>
+							<ContentPresenter Margin="{TemplateBinding Padding}"
+											  VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+											  HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+											  RecognizesAccessKey="True"/>
+						</BulletDecorator>
+						<ControlTemplate.Triggers>
+							<Trigger Property="IsChecked" Value="True">
+								<Setter TargetName="CheckMark" Property="Visibility" Value="Visible"/>
+							</Trigger>
+							<Trigger Property="IsMouseOver" Value="True">
+								<Setter TargetName="CheckBoxBorder" Property="BorderBrush" Value="{DynamicResource {x:Static vsshell:VsBrushes.CommandBarSelectedBorderKey}}"/>
+							</Trigger>
+							<Trigger Property="IsEnabled" Value="False">
+								<Setter Property="Foreground" Value="{DynamicResource {x:Static vsshell:VsBrushes.GrayTextKey}}"/>
+								<Setter TargetName="CheckBoxBorder" Property="BorderBrush" Value="{DynamicResource {x:Static vsshell:VsBrushes.GrayTextKey}}"/>
+								<Setter TargetName="CheckMark" Property="Stroke" Value="{DynamicResource {x:Static vsshell:VsBrushes.GrayTextKey}}"/>
+							</Trigger>
+						</ControlTemplate.Triggers>
+					</ControlTemplate>
+				</Setter.Value>
+			</Setter>
+		</Style>
 	</UserControl.Resources>
 
 	<Grid x:Name="MainGrid">
@@ -223,13 +315,14 @@
 				<!-- Left cluster -->
 				<StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Top">
 
-                    <!-- Checkbox include active document and seldction in the prompt-->
+					<!-- Checkbox include active document and seldction in the prompt-->
                     <CheckBox x:Name="ChkBxActiveDocSelectionAttached"
-                              Content="📋 📄📎"
-                              IsChecked="True" VerticalContentAlignment="Center"
-                              FontSize="14"/>
+                              Content="📋"                              
+                              VerticalAlignment="Center"
+							  FontSize="14"							   
+							  ToolTip="Include active document and selection."/>
 
-					<Button x:Name="AttachDropdownButton"
+                    <Button x:Name="AttachDropdownButton"
                             Content="📎"
                             Style="{StaticResource IconButtonStyle}"
                             Width="30"
