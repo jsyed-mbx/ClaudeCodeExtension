@@ -222,17 +222,12 @@
 
 				<!-- Left cluster -->
 				<StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Top">
-					<!-- Send button (visible only when Send-with-Enter is off) -->
-					<Button x:Name="SendPromptButton"
-                            Content="▶"
-                            Width="30"
-                            MinWidth="30"
-                            FontSize="14"
-                            Style="{StaticResource IconButtonStyle}"
-                            Click="SendButton_Click"
-                            Visibility="Collapsed"
-                            ToolTip="Send Prompt to Code Agent"
-                            Margin="0,0,6,0"/>
+
+                    <!-- Checkbox include active document and seldction in the prompt-->
+                    <CheckBox x:Name="ChkBxActiveDocSelectionAttached"
+                              Content="📋 📄📎"
+                              IsChecked="True" VerticalContentAlignment="Center"
+                              FontSize="14"/>
 
 					<Button x:Name="AttachDropdownButton"
                             Content="📎"
@@ -256,7 +251,19 @@
 								</ContextMenu>
 							</Button.ContextMenu>
 						</Button>
-				</StackPanel>
+                    
+						<!-- Send button (visible only when Send-with-Enter is off) -->
+						<Button x:Name="SendPromptButton"
+								Content="▶"
+								Width="30"
+								MinWidth="30"
+								FontSize="14"
+								Style="{StaticResource IconButtonStyle}"
+								Click="SendButton_Click"
+								Visibility="Collapsed"
+								ToolTip="Send Prompt to Code Agent"
+								Margin="10,10,16,10"/>
+                </StackPanel>
 
                 <!-- Right-aligned buttons (Restart + Model + Settings + Update) -->
 				<StackPanel Grid.Column="2"

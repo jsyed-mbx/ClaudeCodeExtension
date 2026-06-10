@@ -160,7 +160,7 @@ namespace ClaudeCodeVS
                     fullPrompt.AppendLine();
                 }
 
-                if (!string.IsNullOrEmpty(filesAndSelections))
+                if (ChkBxActiveDocSelectionAttached.IsChecked.Value && !string.IsNullOrEmpty(filesAndSelections))
                 {
                     fullPrompt.AppendLine(filesAndSelections);
                     fullPrompt.AppendLine();
