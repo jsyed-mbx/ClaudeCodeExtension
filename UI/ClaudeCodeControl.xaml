@@ -345,6 +345,17 @@
 							</Button.ContextMenu>
 						</Button>
                     
+						<!-- Clear button: types /clear in the prompt and sends it -->
+						<Button x:Name="ClearPromptButton"
+								Content="🗑"
+								Width="30"
+								MinWidth="30"
+								FontSize="14"
+								Style="{StaticResource IconButtonStyle}"
+								Click="ClearPromptButton_Click"
+								ToolTip="Type /clear and send"
+								Margin="4,10,6,10"/>
+
 						<!-- Send button (visible only when Send-with-Enter is off) -->
 						<Button x:Name="SendPromptButton"
 								Content="▶"
@@ -353,9 +364,13 @@
 								FontSize="14"
 								Style="{StaticResource IconButtonStyle}"
 								Click="SendButton_Click"
-								Visibility="Collapsed"
+								Visibility="Visible"
 								ToolTip="Send Prompt to Code Agent"
-								Margin="10,10,16,10"/>
+								Margin="4,10,16,10"/>
+                    
+                    
+                    
+                    
                 </StackPanel>
 
                 <!-- Right-aligned buttons (Restart + Model + Settings + Update) -->

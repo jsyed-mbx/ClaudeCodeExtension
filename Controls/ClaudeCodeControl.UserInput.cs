@@ -61,6 +61,15 @@ namespace ClaudeCodeVS
         #region Send Button and Prompt Submission
 
         /// <summary>
+        /// Handles the clear button click - types /clear in the prompt and sends it
+        /// </summary>
+        private void ClearPromptButton_Click(object sender, RoutedEventArgs e)
+        {
+            PromptTextBox.Text = "/clear";
+            SendButton_Click(sender, e);
+        }
+
+        /// <summary>
         /// Handles send button click - sends the prompt to the terminal
         /// </summary>
 #pragma warning disable VSTHRD100 // Avoid async void methods
