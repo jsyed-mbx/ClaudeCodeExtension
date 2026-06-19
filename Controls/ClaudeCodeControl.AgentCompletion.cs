@@ -50,6 +50,29 @@ namespace ClaudeCodeVS
         private const int TerminalTypingGuardMs = 1500;
         private DateTime _lastTerminalKeyUtc = DateTime.MinValue;
 
+        // While the settled screen is classified as the agent waiting for the user's reply
+        // (a y/n or selection menu), each AttachConsole/FreeConsole on VS can bounce the embedded
+        // conhost's keyboard focus, so polling while the user is answering eats arrow keys. In
+        // that state the capture stops entirely while the terminal is focused (the user can see
+        // the result themselves, and only their reply ends the wait) and, while unfocused, backs
+        // off from the normal 1 s cadence to this interval — so a user clicking in to answer isn't
+        // fought by a rapid attach storm, while an agent that resumes on its own is still noticed.
+        private const int InputPromptRecheckMs = 10000;
+        private bool _awaitingAgentInputReply;
+        private DateTime _lastInputPromptRecheckUtc = DateTime.MinValue;
+
+        // devenv's standard handles as they were before this extension ever attached to a
+        // console. AttachConsole REPLACES the process's std handles and FreeConsole leaves
+        // them dangling; if they are not restored, the dead handle values poison every later
+        // "conhost.exe -- cmd.exe" spawn (the fresh conhost inherits them and exits within
+        // ~100 ms with code 0), which is why the blank panel survived until VS was reopened
+        // (issue #73, "On Agent Finish" repro).
+        private static readonly object _stdHandleCaptureLock = new object();
+        private static bool _originalStdHandlesCaptured;
+        private static IntPtr _originalStdIn;
+        private static IntPtr _originalStdOut;
+        private static IntPtr _originalStdErr;
+
         private DispatcherTimer _agentCompletionTimer;
         private bool _completionWatchActive;
         private bool _completionTickBusy;
@@ -127,6 +150,30 @@ namespace ClaudeCodeVS
             return string.Empty;
         }
 
+        /// <summary>
+        /// Re-applies the current "On Agent Finish" settings to a watch that is already running,
+        /// so changes the user makes in the settings dialog while the agent is mid-turn take
+        /// effect when that turn finishes (instead of using the snapshot captured when the prompt
+        /// was sent). No-op when no watch is active. If the feature was turned off, the watcher
+        /// is stopped; otherwise the newly-resolved effective config replaces the captured one.
+        /// </summary>
+        internal void RefreshWatchedAgentFinishConfig()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            if (!_completionWatchActive) return;
+
+            var cfg = GetEffectiveAgentFinish();
+            if (cfg == null || !cfg.Enabled)
+            {
+                // Feature disabled mid-turn → stop watching; no notification/action will fire.
+                StopAgentCompletionTimer();
+                return;
+            }
+
+            _watchedAgentFinish = cfg;
+        }
+
         #endregion
 
         #region Arm / Disarm
@@ -182,6 +229,8 @@ namespace ClaudeCodeVS
                 _watchedConsolePid = pid;
                 _lastConsoleHash = initialHash;
                 _consoleSawActivity = false;
+                _awaitingAgentInputReply = false;
+                _lastInputPromptRecheckUtc = DateTime.MinValue;
                 _promptSentUtc = DateTime.UtcNow;
                 _watchStartedUtc = DateTime.UtcNow;
                 _lastConsoleChangeUtc = DateTime.UtcNow;
@@ -222,14 +271,16 @@ namespace ClaudeCodeVS
         }
 
         /// <summary>
-        /// Resets the completion watcher and clears any pending notification when the
-        /// solution changes. Stopping the watcher before the terminal restarts is important:
-        /// otherwise its 1-second console-attach tick can overlap the new terminal launch and
-        /// leave Visual Studio attached to the old console, which breaks the embedded cmd. Also
-        /// dismisses the agent-finish info bar so a stale "finished" notification from the
-        /// previous solution doesn't linger after switching.
+        /// Resets the completion watcher and clears any pending notification. Runs on solution
+        /// change and before every terminal start (restart button, provider/model switch, theme
+        /// restart, session resume). Stopping the watcher before the terminal restarts is
+        /// important: otherwise its 1-second console-attach tick can overlap the new terminal
+        /// launch and leave Visual Studio attached to the old console, which makes the new
+        /// conhost fail to create its window and renders the embedded terminal blank (issue #73).
+        /// Also dismisses the agent-finish info bar so a stale "finished" notification from the
+        /// previous session doesn't linger.
         /// </summary>
-        internal void ResetAgentCompletionForSolutionChange()
+        internal void ResetAgentCompletionWatcher()
         {
             ThreadHelper.ThrowIfNotOnUIThread();
             StopAgentCompletionTimer();
@@ -258,14 +309,78 @@ namespace ClaudeCodeVS
                 System.Threading.Monitor.TryEnter(_consoleSnapshotLock, 250, ref taken);
                 if (taken)
                 {
+                    CaptureOriginalStdHandlesOnce();
                     try { FreeConsole(); }
                     catch { }
+                    RestoreOriginalStdHandles();
                 }
             }
             finally
             {
                 if (taken) System.Threading.Monitor.Exit(_consoleSnapshotLock);
             }
+        }
+
+        /// <summary>
+        /// Records devenv's standard handles the first time any console operation runs — i.e.
+        /// before this extension has ever attached to a console, so the values are the process's
+        /// true originals (typically NULL for a GUI app). Later restores write these back.
+        /// </summary>
+        private static void CaptureOriginalStdHandlesOnce()
+        {
+            if (_originalStdHandlesCaptured) return;
+            lock (_stdHandleCaptureLock)
+            {
+                if (_originalStdHandlesCaptured) return;
+                try
+                {
+                    _originalStdIn = GetStdHandle(STD_INPUT_HANDLE);
+                    _originalStdOut = GetStdHandle(STD_OUTPUT_HANDLE);
+                    _originalStdErr = GetStdHandle(STD_ERROR_HANDLE);
+                    _originalStdHandlesCaptured = true;
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"CaptureOriginalStdHandlesOnce error: {ex.Message}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Puts devenv's standard handles back to their pre-attach originals. AttachConsole
+        /// replaces them with handles into the attached console and FreeConsole does NOT undo
+        /// that, so without this the process keeps dangling std handles after the agent's
+        /// console dies — and a child terminal spawned later inherits the dead values and exits
+        /// immediately (issue #73). Returns true when any handle actually needed resetting,
+        /// so the launch log can confirm or rule out this cause on a user's machine.
+        /// </summary>
+        internal static bool RestoreOriginalStdHandles()
+        {
+            if (!_originalStdHandlesCaptured) return false;
+            bool wasDirty = false;
+            try
+            {
+                if (GetStdHandle(STD_INPUT_HANDLE) != _originalStdIn)
+                {
+                    wasDirty = true;
+                    SetStdHandle(STD_INPUT_HANDLE, _originalStdIn);
+                }
+                if (GetStdHandle(STD_OUTPUT_HANDLE) != _originalStdOut)
+                {
+                    wasDirty = true;
+                    SetStdHandle(STD_OUTPUT_HANDLE, _originalStdOut);
+                }
+                if (GetStdHandle(STD_ERROR_HANDLE) != _originalStdErr)
+                {
+                    wasDirty = true;
+                    SetStdHandle(STD_ERROR_HANDLE, _originalStdErr);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"RestoreOriginalStdHandles error: {ex.Message}");
+            }
+            return wasDirty;
         }
 
         /// <summary>
@@ -326,6 +441,27 @@ namespace ClaudeCodeVS
                         return;
                     }
 
+                    // While the agent is waiting for the user's reply (y/n box, selection menu),
+                    // the screen is static and there is nothing to detect until the user answers.
+                    // Each console attach can bounce the embedded terminal's keyboard focus, so the
+                    // attach storm here is what made arrow keys / typed answers unreliable — the
+                    // user had to click the panel and the agent tab repeatedly before a keystroke
+                    // landed. The user answers by typing into the *focused* terminal, so:
+                    //   • Focused  → never attach. There is nothing to detect until the user acts,
+                    //                and while focused they can see the result themselves, so a
+                    //                delayed finish notification costs nothing. This is what stops
+                    //                a poll from knocking focus out from under them mid-reply.
+                    //   • Unfocused → attach, but only every InputPromptRecheckMs (not every
+                    //                second), so a user clicking in to answer isn't fought by a
+                    //                rapid attach storm, while an agent that resumes on its own is
+                    //                still noticed within ~10 s.
+                    if (_awaitingAgentInputReply)
+                    {
+                        if (IsTerminalFocused()) return;
+                        if ((DateTime.UtcNow - _lastInputPromptRecheckUtc).TotalMilliseconds < InputPromptRecheckMs) return;
+                    }
+
+                    _lastInputPromptRecheckUtc = DateTime.UtcNow;
                     string text = await Task.Run(() => TryCaptureConsoleText(pid));
                     string hash = text != null ? ComputeStableHash(text) : null;
                     if (hash == null)
@@ -338,24 +474,37 @@ namespace ClaudeCodeVS
 
                     if (_lastConsoleHash == null || !string.Equals(hash, _lastConsoleHash, StringComparison.Ordinal))
                     {
-                        // Screen changed → agent is still working.
+                        // Screen changed → agent is still working, the user answered the prompt,
+                        // OR the user is navigating an input prompt (arrow-keying a selection menu
+                        // moves the ❯ cursor, which changes the screen too). Keep the "awaiting
+                        // reply" backoff engaged whenever the changed screen still looks like a
+                        // prompt: clearing it on every keystroke dropped the cadence back to 1 s,
+                        // so the next console attach landed under the user's fingers and ate the
+                        // arrow keys (reported while answering the agent's questions in plan mode).
                         _lastConsoleHash = hash;
                         _lastConsoleChangeUtc = DateTime.UtcNow;
                         _consoleSawActivity = true;
+                        _awaitingAgentInputReply = LooksLikeAgentInputPrompt(text);
                         return;
                     }
 
                     // Don't fire until the agent actually produced output this turn.
                     if (!_consoleSawActivity) return;
 
+                    // A static y/n or selection prompt also reads as idle, so classify the settled
+                    // screen as soon as it holds still for one tick — before waiting out the full
+                    // idle window. If the agent is waiting for input, this is not a completion:
+                    // don't fire and keep watching, so the notification lands on the real finish
+                    // after the user answers. Entering the waiting state also slows the capture
+                    // cadence (see the gate above) so the user's reply isn't disturbed by reads.
+                    if (LooksLikeAgentInputPrompt(text))
+                    {
+                        _awaitingAgentInputReply = true;
+                        return;
+                    }
+
                     int idle = Math.Max(2, Math.Min(120, _watchedAgentFinish?.IdleSeconds ?? 3));
                     if ((DateTime.UtcNow - _lastConsoleChangeUtc).TotalSeconds < idle) return;
-
-                    // Settled — but a static y/n or selection prompt also reads as idle. If the
-                    // screen looks like the agent is waiting for input, this is not a completion:
-                    // don't fire and keep watching, so the notification lands on the real finish
-                    // after the user answers (the screen will change → activity → re-evaluate).
-                    if (LooksLikeAgentInputPrompt(text)) return;
 
                     // Settled — the turn is done.
                     var cfg = _watchedAgentFinish;
@@ -418,6 +567,10 @@ namespace ClaudeCodeVS
 
             lock (_consoleSnapshotLock)
             {
+                // AttachConsole below will overwrite the process's standard handles; remember
+                // the originals so the finally can put them back (FreeConsole won't).
+                CaptureOriginalStdHandlesOnce();
+
                 IntPtr handle = IntPtr.Zero;
                 bool attached = false;
                 bool ctrlGuarded = false;
@@ -479,7 +632,175 @@ namespace ClaudeCodeVS
                 finally
                 {
                     if (handle != IntPtr.Zero && handle.ToInt64() != -1) CloseHandle(handle);
-                    if (attached) FreeConsole();
+                    if (attached)
+                    {
+                        FreeConsole();
+                        // FreeConsole leaves the std handles AttachConsole installed dangling;
+                        // restore the originals so no capture ever poisons a later spawn.
+                        RestoreOriginalStdHandles();
+                    }
+                    if (ctrlGuarded) SetConsoleCtrlHandler(IntPtr.Zero, false);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Best-effort probe of whether the embedded conhost is currently in mouse-input mode — i.e.
+        /// QuickEdit is disabled because a running TUI captures the mouse. In that state conhost's
+        /// own right-click paste and Ctrl+Scroll zoom are swallowed by the app (issue #76), so the
+        /// paste path should deliver text through keystrokes instead of the clipboard right-click.
+        /// Reuses the same guarded AttachConsole machinery as the completion watcher (serialized by
+        /// <see cref="_consoleSnapshotLock"/>, std-handle hygiene restored in the finally); returns
+        /// false on any failure so callers fall back to the normal paste path. Call off the UI
+        /// thread — it briefly attaches VS's process to the agent's console.
+        /// </summary>
+        private bool IsTerminalInMouseInputMode()
+        {
+            // Resolve the console *client* (cmd.exe) from the terminal window; conhostPid 0 just
+            // means "derive it from terminalHandle" inside ResolveConsoleClientPid.
+            int clientPid = ResolveConsoleClientPid(0);
+            if (clientPid <= 0) return false;
+
+            lock (_consoleSnapshotLock)
+            {
+                // AttachConsole overwrites the process's standard handles; remember the originals
+                // so the finally can put them back (FreeConsole won't).
+                CaptureOriginalStdHandlesOnce();
+
+                IntPtr handle = IntPtr.Zero;
+                bool attached = false;
+                bool ctrlGuarded = false;
+                try
+                {
+                    // Shield VS from a console Ctrl+C during the brief attach window.
+                    SetConsoleCtrlHandler(IntPtr.Zero, true);
+                    ctrlGuarded = true;
+
+                    if (!AttachConsole((uint)clientPid))
+                    {
+                        Debug.WriteLine($"IsTerminalInMouseInputMode: AttachConsole({clientPid}) failed, Win32={Marshal.GetLastWin32Error()}");
+                        return false;
+                    }
+                    attached = true;
+
+                    handle = CreateFile("CONIN$",
+                        GENERIC_READ_CONSOLE | GENERIC_WRITE_CONSOLE,
+                        FILE_SHARE_READ_CONSOLE | FILE_SHARE_WRITE_CONSOLE,
+                        IntPtr.Zero, OPEN_EXISTING_CONSOLE, 0, IntPtr.Zero);
+                    if (handle.ToInt64() == -1 || handle == IntPtr.Zero) return false;
+
+                    if (!GetConsoleMode(handle, out uint mode)) return false;
+
+                    // QuickEdit cleared ⇒ a TUI holds the console in mouse-input mode, so conhost's
+                    // native right-click paste / Ctrl+Scroll zoom won't work for this session.
+                    return (mode & ENABLE_QUICK_EDIT_MODE) == 0;
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"IsTerminalInMouseInputMode error: {ex.Message}");
+                    return false;
+                }
+                finally
+                {
+                    if (handle != IntPtr.Zero && handle.ToInt64() != -1) CloseHandle(handle);
+                    if (attached)
+                    {
+                        FreeConsole();
+                        // FreeConsole leaves the std handles AttachConsole installed dangling;
+                        // restore the originals so the probe never poisons a later conhost spawn.
+                        RestoreOriginalStdHandles();
+                    }
+                    if (ctrlGuarded) SetConsoleCtrlHandler(IntPtr.Zero, false);
+                }
+            }
+        }
+
+        // Pixel change in cell height per Ctrl+Scroll notch, and the clamp range for the resulting
+        // console font height. Mirrors the rough feel of conhost's native Ctrl+Wheel font stepping.
+        private const short ConhostZoomStepPx = 2;
+        private const short ConhostZoomMinPx = 6;
+        private const short ConhostZoomMaxPx = 60;
+
+        /// <summary>
+        /// Changes the embedded conhost's font size by <paramref name="stepUnits"/> notches (each
+        /// notch = <see cref="ConhostZoomStepPx"/> pixels of cell height), the same way conhost's own
+        /// Ctrl+Scroll zoom does. Unlike posting WM_MOUSEWHEEL — which a TUI in mouse-input mode
+        /// swallows, killing native Ctrl+Scroll zoom (issue #76/#78) — this sets the font directly via
+        /// SetCurrentConsoleFontEx, so it works whether QuickEdit is on or off. Reuses the same guarded
+        /// AttachConsole machinery as the completion watcher (serialized by <see cref="_consoleSnapshotLock"/>,
+        /// std-handle hygiene restored in the finally). Returns false on any failure. Call off the UI
+        /// thread — it briefly attaches VS's process to the agent's console.
+        /// </summary>
+        private bool TryAdjustConhostFontSize(int stepUnits)
+        {
+            if (stepUnits == 0) return false;
+
+            int clientPid = ResolveConsoleClientPid(0);
+            if (clientPid <= 0) return false;
+
+            lock (_consoleSnapshotLock)
+            {
+                // AttachConsole overwrites the process's standard handles; remember the originals
+                // so the finally can put them back (FreeConsole won't).
+                CaptureOriginalStdHandlesOnce();
+
+                IntPtr handle = IntPtr.Zero;
+                bool attached = false;
+                bool ctrlGuarded = false;
+                try
+                {
+                    // Shield VS from a console Ctrl+C during the brief attach window.
+                    SetConsoleCtrlHandler(IntPtr.Zero, true);
+                    ctrlGuarded = true;
+
+                    if (!AttachConsole((uint)clientPid))
+                    {
+                        Debug.WriteLine($"TryAdjustConhostFontSize: AttachConsole({clientPid}) failed, Win32={Marshal.GetLastWin32Error()}");
+                        return false;
+                    }
+                    attached = true;
+
+                    // Font APIs operate on the active screen buffer (CONOUT$).
+                    handle = CreateFile("CONOUT$",
+                        GENERIC_READ_CONSOLE | GENERIC_WRITE_CONSOLE,
+                        FILE_SHARE_READ_CONSOLE | FILE_SHARE_WRITE_CONSOLE,
+                        IntPtr.Zero, OPEN_EXISTING_CONSOLE, 0, IntPtr.Zero);
+                    if (handle.ToInt64() == -1 || handle == IntPtr.Zero) return false;
+
+                    var font = new CONSOLE_FONT_INFOEX { cbSize = (uint)Marshal.SizeOf(typeof(CONSOLE_FONT_INFOEX)) };
+                    if (!GetCurrentConsoleFontEx(handle, false, ref font)) return false;
+
+                    int newHeight = font.dwFontSize.Y + stepUnits * ConhostZoomStepPx;
+                    if (newHeight < ConhostZoomMinPx) newHeight = ConhostZoomMinPx;
+                    if (newHeight > ConhostZoomMaxPx) newHeight = ConhostZoomMaxPx;
+                    if (newHeight == font.dwFontSize.Y) return false;
+
+                    font.dwFontSize.Y = (short)newHeight;
+                    // For TrueType fonts (conhost's default — Cascadia/Consolas), zero the width so
+                    // conhost derives it from the height and the font's aspect ratio. Raster fonts
+                    // keep their reported width and snap to the nearest available size.
+                    if ((font.FontFamily & TMPF_TRUETYPE) != 0)
+                    {
+                        font.dwFontSize.X = 0;
+                    }
+
+                    return SetCurrentConsoleFontEx(handle, false, ref font);
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"TryAdjustConhostFontSize error: {ex.Message}");
+                    return false;
+                }
+                finally
+                {
+                    if (handle != IntPtr.Zero && handle.ToInt64() != -1) CloseHandle(handle);
+                    if (attached)
+                    {
+                        FreeConsole();
+                        // FreeConsole leaves the std handles AttachConsole installed dangling;
+                        // restore the originals so the zoom never poisons a later conhost spawn.
+                        RestoreOriginalStdHandles();
+                    }
                     if (ctrlGuarded) SetConsoleCtrlHandler(IntPtr.Zero, false);
                 }
             }
@@ -711,10 +1032,10 @@ namespace ClaudeCodeVS
                 {
                     case AgentFinishActionType.BuildSolution:       ExecuteDteCommand("Build.BuildSolution"); break;
                     case AgentFinishActionType.RebuildSolution:     ExecuteDteCommand("Build.RebuildSolution"); break;
-                    case AgentFinishActionType.Run:                 ExecuteDteCommand("Debug.Start"); break;
-                    case AgentFinishActionType.RunWithoutDebugging: ExecuteDteCommand("Debug.StartWithoutDebugging"); break;
+                    case AgentFinishActionType.Run:                 await PrepareAndRunAsync("Debug.Start", cfg.CleanBeforeRun, cfg.RebuildBeforeRun); break;
+                    case AgentFinishActionType.RunWithoutDebugging: await PrepareAndRunAsync("Debug.StartWithoutDebugging", cfg.CleanBeforeRun, cfg.RebuildBeforeRun); break;
                     case AgentFinishActionType.RunTests:            ExecuteDteCommand("TestExplorer.RunAllTests"); break;
-                    case AgentFinishActionType.RunScript:           await RunFinishScriptAsync(cfg.ScriptOrCommand); break;
+                    case AgentFinishActionType.RunScript:           await RunFinishScriptAsync(cfg.ScriptOrCommand, cfg.AutoCloseScript); break;
                     case AgentFinishActionType.SendToAgent:
                         if (!string.IsNullOrWhiteSpace(cfg.ScriptOrCommand))
                             await SendTextToTerminalAsync(cfg.ScriptOrCommand);
@@ -725,6 +1046,94 @@ namespace ClaudeCodeVS
             {
                 Debug.WriteLine($"ExecuteAgentFinishActionAsync error: {ex.Message}");
             }
+        }
+
+        private async Task PrepareAndRunAsync(string runCommand, bool cleanBeforeRun, bool rebuildBeforeRun)
+        {
+            await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+
+            if (cleanBeforeRun)
+            {
+                ExecuteDteCommand("Build.CleanSolution");
+                if (!await WaitForDteBuildToFinishAsync())
+                {
+                    ShowAgentFinishActionWarning("The solution clean did not finish in time. The run action was skipped.");
+                    return;
+                }
+            }
+
+            if (rebuildBeforeRun)
+            {
+                ExecuteDteCommand("Build.RebuildSolution");
+                if (!await WaitForDteBuildToFinishAsync())
+                {
+                    ShowAgentFinishActionWarning("The solution rebuild did not finish in time. The run action was skipped.");
+                    return;
+                }
+
+                await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+                int failedProjects = 0;
+                try
+                {
+                    var dte = Package.GetGlobalService(typeof(EnvDTE.DTE)) as EnvDTE.DTE;
+                    failedProjects = dte?.Solution?.SolutionBuild?.LastBuildInfo ?? 0;
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Unable to read LastBuildInfo before run action: {ex.Message}");
+                }
+
+                if (failedProjects > 0)
+                {
+                    ShowAgentFinishActionWarning("The solution rebuild failed. The run action was skipped.");
+                    return;
+                }
+            }
+
+            ExecuteDteCommand(runCommand);
+        }
+
+        private static async Task<bool> WaitForDteBuildToFinishAsync()
+        {
+            var timeout = TimeSpan.FromMinutes(10);
+            var minObservation = TimeSpan.FromMilliseconds(750);
+            var sw = Stopwatch.StartNew();
+            bool observedBuildInProgress = false;
+
+            while (sw.Elapsed < timeout)
+            {
+                await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+                EnvDTE.vsBuildState state = EnvDTE.vsBuildState.vsBuildStateDone;
+                try
+                {
+                    var dte = Package.GetGlobalService(typeof(EnvDTE.DTE)) as EnvDTE.DTE;
+                    state = dte?.Solution?.SolutionBuild?.BuildState ?? EnvDTE.vsBuildState.vsBuildStateDone;
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Unable to read build state: {ex.Message}");
+                    return true;
+                }
+
+                if (state == EnvDTE.vsBuildState.vsBuildStateInProgress)
+                {
+                    observedBuildInProgress = true;
+                }
+                else if (observedBuildInProgress || sw.Elapsed >= minObservation)
+                {
+                    return true;
+                }
+
+                await Task.Delay(250);
+            }
+
+            return false;
+        }
+
+        private static void ShowAgentFinishActionWarning(string message)
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            MessageBox.Show(message, "On Agent Finish", MessageBoxButton.OK, MessageBoxImage.Warning);
         }
 
         private static void ExecuteDteCommand(string command)
@@ -743,10 +1152,12 @@ namespace ClaudeCodeVS
 
         /// <summary>
         /// Launches a script (deploy.cmd etc.) in the workspace directory. Relative paths
-        /// are resolved against the workspace. UseShellExecute lets a .cmd/.bat open its own
-        /// console so the user can watch its output.
+        /// are resolved against the workspace. A .cmd/.bat is launched through cmd.exe and a
+        /// .ps1 through powershell.exe, so the script runs (a .ps1's default shell verb is
+        /// Edit, which would just open it in an editor). The console can stay open afterwards
+        /// for the user to read its output or auto-close based on the setting.
         /// </summary>
-        private async Task RunFinishScriptAsync(string script)
+        private async Task RunFinishScriptAsync(string script, bool autoClose)
         {
             if (string.IsNullOrWhiteSpace(script)) return;
 
@@ -760,12 +1171,37 @@ namespace ClaudeCodeVS
                     if (File.Exists(combined)) path = combined;
                 }
 
-                var psi = new ProcessStartInfo
+                string ext = Path.GetExtension(path).ToLowerInvariant();
+                ProcessStartInfo psi;
+                if (ext == ".cmd" || ext == ".bat")
                 {
-                    FileName = path,
-                    WorkingDirectory = workspace,
-                    UseShellExecute = true
-                };
+                    psi = new ProcessStartInfo
+                    {
+                        FileName = "cmd.exe",
+                        Arguments = $"{(autoClose ? "/c" : "/k")} \"{path}\"",
+                        WorkingDirectory = workspace,
+                        UseShellExecute = true
+                    };
+                }
+                else if (ext == ".ps1")
+                {
+                    psi = new ProcessStartInfo
+                    {
+                        FileName = "powershell.exe",
+                        Arguments = $"-ExecutionPolicy Bypass {(autoClose ? string.Empty : "-NoExit ")}-File \"{path}\"",
+                        WorkingDirectory = workspace,
+                        UseShellExecute = true
+                    };
+                }
+                else
+                {
+                    psi = new ProcessStartInfo
+                    {
+                        FileName = path,
+                        WorkingDirectory = workspace,
+                        UseShellExecute = true
+                    };
+                }
                 Process.Start(psi);
             }
             catch (Exception ex)
@@ -828,8 +1264,8 @@ namespace ClaudeCodeVS
             {
                 case AgentFinishActionType.BuildSolution: return "Build solution";
                 case AgentFinishActionType.RebuildSolution: return "Rebuild solution";
-                case AgentFinishActionType.Run: return "Run (F5)";
-                case AgentFinishActionType.RunWithoutDebugging: return "Run without debugging";
+                case AgentFinishActionType.Run: return DescribeRunAction("run", cfg);
+                case AgentFinishActionType.RunWithoutDebugging: return DescribeRunAction("run without debugging", cfg);
                 case AgentFinishActionType.RunTests: return "Run all tests";
                 case AgentFinishActionType.RunScript:
                     string s = cfg.ScriptOrCommand?.Trim().Trim('"');
@@ -841,6 +1277,26 @@ namespace ClaudeCodeVS
                         : $"Send {(c.Length > 24 ? c.Substring(0, 24) + "…" : c)}";
                 default: return string.Empty;
             }
+        }
+
+        private static string DescribeRunAction(string runLabel, AgentFinishConfig cfg)
+        {
+            if (cfg.CleanBeforeRun && cfg.RebuildBeforeRun)
+            {
+                return $"Clean, rebuild, then {runLabel}";
+            }
+
+            if (cfg.CleanBeforeRun)
+            {
+                return $"Clean, then {runLabel}";
+            }
+
+            if (cfg.RebuildBeforeRun)
+            {
+                return $"Rebuild, then {runLabel}";
+            }
+
+            return char.ToUpperInvariant(runLabel[0]) + runLabel.Substring(1);
         }
 
         private static string FormatDuration(TimeSpan d)

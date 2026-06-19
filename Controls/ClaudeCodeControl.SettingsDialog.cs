@@ -80,7 +80,6 @@ namespace ClaudeCodeVS
             ThemePreference origThemePref     = _settings.SelectedThemePreference;
             int  origCustomColorArgb          = _settings.CustomThemeColorArgb;
             bool origSkipThemePrompt          = _settings.SkipThemeRestartPrompt;
-            bool origDisableBringToFront      = _settings.DisableBringToForeground;
             bool origShowInlineBars           = _settings.ShowInlineUsageBars;
             int  origAutoRefresh              = _settings.UsageAutoRefreshSeconds;
             int  origFontSize                 = (int)Math.Round(PromptTextBox?.FontSize ?? 12.0);
@@ -178,14 +177,6 @@ namespace ClaudeCodeVS
                 origAutoOpenChanges, themeFg);
             behaviorStack.Children.Add(autoOpenCheck);
 
-            behaviorStack.Children.Add(MakeSectionHeader("Window", themeFg));
-
-            var disableBringToFrontCheck = MakeCheckBox(
-                "Don't bring Visual Studio to the foreground on terminal click",
-                "When enabled, clicking the embedded terminal no longer pulls the entire Visual Studio window to the front. Useful when you overlap multiple VS instances or other apps and want to interact with the terminal without rearranging your window layout.",
-                origDisableBringToFront, themeFg);
-            behaviorStack.Children.Add(disableBringToFrontCheck);
-
             // Prompt font size
             behaviorStack.Children.Add(MakeSectionHeader("Prompt font size", themeFg));
             behaviorStack.Children.Add(new TextBlock
@@ -236,6 +227,21 @@ namespace ClaudeCodeVS
             afOpenButton.Click += (s, ea) => _ = ShowAgentFinishSettingsDialogAsync();
 #pragma warning restore VSTHRD110
             behaviorStack.Children.Add(afOpenButton);
+
+            // Detection reads the conhost screen buffer, which Windows Terminal hosts in a
+            // separate process the console API can't read — so the feature is unavailable
+            // under Windows Terminal. Shown/hidden live by SyncAgentFinishAvailability().
+            var afWtHint = new TextBlock
+            {
+                Text = "Unavailable with Windows Terminal — switch the terminal type to Command Prompt (Terminal tab) to use this.",
+                FontSize = 11,
+                Opacity = 0.7,
+                Foreground = themeFg,
+                TextWrapping = TextWrapping.Wrap,
+                Visibility = Visibility.Collapsed,
+                Margin = new Thickness(4, 2, 0, 4)
+            };
+            behaviorStack.Children.Add(afWtHint);
 
             // ========================= Layout tab =========================
             var layoutStack = AddTab("Layout");
@@ -311,6 +317,20 @@ namespace ClaudeCodeVS
             cmdRadio.Checked += (s, e) => SyncDisableClipboardAvailability();
             wtRadio.Checked += (s, e) => SyncDisableClipboardAvailability();
             SyncDisableClipboardAvailability();
+
+            // "On Agent Finish" detection can only read the conhost screen buffer, so it is
+            // disabled for Windows Terminal. Keep the button (on the Behavior tab) and its hint
+            // in sync with the terminal-type radios live, the same way the clipboard toggle is.
+            void SyncAgentFinishAvailability()
+            {
+                bool cmdSelected = cmdRadio.IsChecked == true;
+                afOpenButton.IsEnabled = cmdSelected;
+                afOpenButton.Opacity = cmdSelected ? 1.0 : 0.5;
+                afWtHint.Visibility = cmdSelected ? Visibility.Collapsed : Visibility.Visible;
+            }
+            cmdRadio.Checked += (s, e) => SyncAgentFinishAvailability();
+            wtRadio.Checked += (s, e) => SyncAgentFinishAvailability();
+            SyncAgentFinishAvailability();
 
             // ========================= Theme tab =========================
             var themeStack = AddTab("Theme");
@@ -459,6 +479,10 @@ namespace ClaudeCodeVS
                 autoRefreshCombo.SelectedIndex = 0;
             usageStack.Children.Add(autoRefreshCombo);
 
+            // ========================= CLI Paths tab =========================
+            var cliPathsStack = AddTab("CLI Paths");
+            var cliPathEditors = BuildCliPathsTabContent(cliPathsStack, themeBg, themeFg);
+
             // ---- Button row ----
             var buttonPanel = new Grid { Margin = new Thickness(0, 14, 0, 0) };
             buttonPanel.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
@@ -512,7 +536,12 @@ namespace ClaudeCodeVS
                 cancelButton.Background = themeBg; cancelButton.Foreground = themeFg; cancelButton.BorderBrush = themeFg;
                 resetButton.Background = themeBg; resetButton.Foreground = themeFg; resetButton.BorderBrush = themeFg;
             }
-            okButton.Click += (s, ea) => dialog.DialogResult = true;
+            okButton.Click += (s, ea) =>
+            {
+                // Warn (and keep the dialog open) if a native CLI path doesn't exist on disk.
+                if (!ConfirmCliPathsBeforeClose(cliPathEditors)) return;
+                dialog.DialogResult = true;
+            };
 
             // Reset to Defaults: restore every control on this dialog to its default value.
             // Nothing is persisted until the user confirms with OK.
@@ -540,7 +569,6 @@ namespace ClaudeCodeVS
                 largeAsFileCheck.IsChecked = false;
                 disableClipboardCheck.IsChecked = false;
                 autoOpenCheck.IsChecked = false;
-                disableBringToFrontCheck.IsChecked = false;
                 SelectComboByTag(fontSizeCombo, 12);
                 topRadio.IsChecked = true;                // Top layout
                 disableAutoZoomCheck.IsChecked = false;
@@ -550,6 +578,10 @@ namespace ClaudeCodeVS
                 skipPromptCheck.IsChecked = false;
                 showBarsCheck.IsChecked = true;
                 SelectComboByTag(autoRefreshCombo, 0);    // Off
+
+                // CLI Paths tab: default is no custom path (use detection) for every provider.
+                foreach (var tb in cliPathEditors.Values)
+                    tb.Text = "";
             };
 
             okCancelPanel.Children.Add(okButton);
@@ -572,7 +604,6 @@ namespace ClaudeCodeVS
             bool newSendLargeAsFile = largeAsFileCheck.IsChecked == true;
             bool newDisableClipboardSend = disableClipboardCheck.IsChecked == true;
             bool newAutoOpenChanges = autoOpenCheck.IsChecked == true;
-            bool newDisableBringToFront = disableBringToFrontCheck.IsChecked == true;
             int newFontSize = (fontSizeCombo.SelectedItem as ComboBoxItem)?.Tag is int fs ? fs : origFontSize;
             // Map the selected position back to orientation + invert.
             bool newVertical = leftRadio.IsChecked == true || rightRadio.IsChecked == true;
@@ -638,7 +669,6 @@ namespace ClaudeCodeVS
             _settings.SendLargePromptsAsFile  = newSendLargeAsFile;
             _settings.DisableClipboardSend    = newDisableClipboardSend;
             _settings.AutoOpenChangesOnPrompt = newAutoOpenChanges;
-            _settings.DisableBringToForeground = newDisableBringToFront;
             _settings.InvertLayout            = newInvertLayout;
             _settings.SelectedLayoutOrientation = newOrientation;
             _settings.DisableStartupAutoZoom  = newDisableAutoZoom;
@@ -649,6 +679,13 @@ namespace ClaudeCodeVS
             _settings.ShowInlineUsageBars     = newShowInlineBars;
             _settings.UsageAutoRefreshSeconds = newAutoRefresh;
             _settings.PromptFontSize          = newFontSize;
+
+            // Custom CLI executable paths (CLI Paths tab). Mutates _settings.CustomExecutablePaths
+            // and returns the providers whose path actually changed.
+            var changedCliProviders = ApplyCliPathChanges(cliPathEditors);
+            bool cliPathsChanged = changedCliProviders.Count > 0;
+            // Only the active provider's path change warrants relaunching the terminal.
+            bool activeCliPathChanged = changedCliProviders.Contains(_settings.SelectedProvider);
 
             // On Agent Finish is configured in its own dialog (opened by the button above),
             // which persists its own changes; nothing to apply here.
@@ -695,9 +732,16 @@ namespace ClaudeCodeVS
 
             SaveSettings();
 
+            // A CLI path change alters detection results — drop the availability cache so the
+            // next check (and menu state) reflects the override, and relaunch the active provider.
+            if (cliPathsChanged)
+            {
+                ClearProviderCache();
+            }
+
             // ---- Restart-requiring changes ----
             bool terminalTypeChanged = newTerminalType != origTerminalType;
-            bool needsRestart = terminalTypeChanged;
+            bool needsRestart = terminalTypeChanged || activeCliPathChanged;
 
             // For theme changes, ask the user (respecting the skip-prompt opt-out
             // and the same "agent color already matches" short-circuit used elsewhere)

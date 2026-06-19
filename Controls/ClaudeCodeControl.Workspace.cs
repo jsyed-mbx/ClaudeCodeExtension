@@ -39,6 +39,29 @@ namespace ClaudeCodeVS
         /// </summary>
         private string _lastWorkspaceDirectory;
 
+        /// <summary>
+        /// True while a workspace-change evaluation is running (UI-thread only).
+        /// </summary>
+        private bool _workspaceChangeInProgress;
+
+        /// <summary>
+        /// Set when a workspace-change request arrives while another is running; the
+        /// in-flight evaluation re-runs once more when it finishes (UI-thread only).
+        /// </summary>
+        private bool _workspaceChangeRerunRequested;
+
+        /// <summary>
+        /// Accumulated forceDiffReset flag for the coalesced re-run (UI-thread only).
+        /// </summary>
+        private bool _workspaceChangeRerunForceDiffReset;
+
+        /// <summary>
+        /// Last workspace directory for which an automatic terminal launch was attempted.
+        /// Used to keep delayed solution/project events from retrying the same failed launch
+        /// repeatedly during one solution load.
+        /// </summary>
+        private string _lastTerminalLaunchWorkspaceDirectory;
+
         #endregion
 
         #region Workspace Initialization
@@ -198,23 +221,117 @@ namespace ClaudeCodeVS
         }
 
         /// <summary>
+        /// Normalizes a workspace path for stable comparisons across DTE/IVsSolution sources.
+        /// </summary>
+        private static string NormalizeWorkspaceDirectory(string directory)
+        {
+            if (string.IsNullOrWhiteSpace(directory))
+            {
+                return directory;
+            }
+
+            try
+            {
+                return Path.GetFullPath(directory.Trim())
+                    .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            }
+            catch
+            {
+                return directory.Trim().TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            }
+        }
+
+        /// <summary>
+        /// Compares workspace paths using Windows path semantics.
+        /// </summary>
+        private static bool WorkspaceDirectoriesEqual(string left, string right)
+        {
+            return string.Equals(
+                NormalizeWorkspaceDirectory(left),
+                NormalizeWorkspaceDirectory(right),
+                StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
         /// Handles workspace directory changes (solution opened/closed)
         /// Restarts the terminal in the new workspace directory
         /// </summary>
         public async Task OnWorkspaceDirectoryChangedAsync(bool forceDiffReset = false)
         {
+            // Solution load fires this in a burst: the solution-open event, one project-open
+            // event per project, and the control's own startup initialization. Each overlapping
+            // call used to queue its own terminal launch, and every queued launch tore down the
+            // terminal the previous one had just embedded. That stop/relaunch churn of fresh WSL
+            // sessions is what creates the teardown contention behind the blank-panel failures
+            // (issue #73). Coalesce instead: one evaluation runs at a time, and a burst collapses
+            // into a single trailing re-run that sees the terminal already in the right directory
+            // and leaves it alone. All flag access happens on the UI thread.
+            await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+
+            if (_workspaceChangeInProgress)
+            {
+                _workspaceChangeRerunRequested = true;
+                _workspaceChangeRerunForceDiffReset |= forceDiffReset;
+                return;
+            }
+
+            _workspaceChangeInProgress = true;
             try
             {
-                string newWorkspaceDir = await GetWorkspaceDirectoryAsync();
-                bool workspaceChanged = _lastWorkspaceDirectory != newWorkspaceDir;
+                do
+                {
+                    _workspaceChangeRerunRequested = false;
+                    forceDiffReset |= _workspaceChangeRerunForceDiffReset;
+                    _workspaceChangeRerunForceDiffReset = false;
+
+                    await HandleWorkspaceDirectoryChangedAsync(forceDiffReset);
+
+                    await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+                } while (_workspaceChangeRerunRequested);
+            }
+            finally
+            {
+                _workspaceChangeInProgress = false;
+            }
+        }
+
+        /// <summary>
+        /// Single workspace-change evaluation; only called from the coalescing wrapper above.
+        /// </summary>
+        private async Task HandleWorkspaceDirectoryChangedAsync(bool forceDiffReset)
+        {
+            try
+            {
+                string newWorkspaceDir = NormalizeWorkspaceDirectory(await GetWorkspaceDirectoryAsync());
+                bool workspaceChanged = !WorkspaceDirectoriesEqual(_lastWorkspaceDirectory, newWorkspaceDir);
                 bool resetDiff = forceDiffReset || workspaceChanged;
 
                 // Update View Changes button visibility based on git availability
                 await UpdateViewChangesButtonVisibilityAsync();
 
                 // If terminal hasn't been initialized yet, initialize it now
-                if (cmdProcess == null)
+                if (!HasTerminalLaunchState())
                 {
+                    if (WorkspaceDirectoriesEqual(_lastTerminalLaunchWorkspaceDirectory, newWorkspaceDir))
+                    {
+                        LogTerminalLaunch($"skipping repeated automatic terminal launch for workspace={newWorkspaceDir}");
+                        if (resetDiff)
+                        {
+                            bool refreshView = _diffViewerWindow != null;
+                            if (!refreshView)
+                            {
+                                await EnsureDiffViewerWindowAsync(false);
+                                refreshView = _diffViewerWindow != null;
+                            }
+                            await ResetDiffBaselineAsync(refreshView, false, false, true, newWorkspaceDir, true);
+                        }
+                        else
+                        {
+                            await EnsureDiffTrackingStartedAsync(false);
+                        }
+                        return;
+                    }
+
                     _lastWorkspaceDirectory = newWorkspaceDir;
                     await InitializeTerminalAsync();
 
@@ -250,7 +367,7 @@ namespace ClaudeCodeVS
                     // the terminal restarts. Leaving the watcher running lets its console-attach
                     // tick overlap the new terminal launch and break the embedded cmd.
                     await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
-                    ResetAgentCompletionForSolutionChange();
+                    ResetAgentCompletionWatcher();
 
 
                     // Get the selected provider from settings

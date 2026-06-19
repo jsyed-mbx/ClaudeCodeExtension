@@ -93,6 +93,28 @@ namespace ClaudeCodeVS
         /// <param name="text">The text to send to the terminal</param>
         private async Task SendTextToTerminalAsync(string text)
         {
+            // Mouse-input-mode fallback (issue #76): when a TUI has switched the embedded conhost
+            // into mouse-input mode (QuickEdit disabled), conhost's right-click paste is intercepted
+            // by the running app, so the clipboard paste below silently does nothing. Detect that
+            // state and deliver the text through focus-independent WM_CHAR keystrokes instead. Done
+            // before any clipboard work so the user's clipboard is left untouched. Only for plain
+            // conhost providers — Open Code / PI / Antigravity have their own paste handling and
+            // Windows Terminal isn't conhost. The probe is best-effort: any failure returns false
+            // and falls through to the normal clipboard paste, so the common case is unaffected.
+            if (terminalHandle != IntPtr.Zero && IsWindow(terminalHandle)
+                && _wtTabBarHeight == 0
+                && _currentRunningProvider != AiProvider.OpenCode
+                && _currentRunningProvider != AiProvider.Pi
+                && _currentRunningProvider != AiProvider.Antigravity)
+            {
+                bool mouseInputMode = await Task.Run(() => IsTerminalInMouseInputMode());
+                if (mouseInputMode)
+                {
+                    await SendTextViaKeystrokesAsync(text);
+                    return;
+                }
+            }
+
             // Dictionary to store all original clipboard formats and their data
             System.Collections.Generic.Dictionary<string, object> originalClipboardData = null;
 
@@ -331,6 +353,44 @@ namespace ClaudeCodeVS
                 await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
                 MessageBox.Show($"Error sending text to terminal: {ex.Message}",
                               "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        /// <summary>
+        /// Pastes the current clipboard text into the embedded terminal through focus-independent
+        /// WM_CHAR keystrokes, without submitting (no Enter). Used by the right-click-paste fallback
+        /// when the console is in mouse-input mode and conhost's native right-click paste is swallowed
+        /// by the running TUI (issue #78). Best-effort and silent: returns quietly when the clipboard
+        /// holds no text or anything fails, so a failed paste never throws into the mouse hook.
+        /// </summary>
+        private async Task PasteClipboardToTerminalViaKeystrokesAsync()
+        {
+            try
+            {
+                if (terminalHandle == IntPtr.Zero || !IsWindow(terminalHandle)) return;
+
+                await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+
+                string clipboardText = await ClipboardRetryAsync(
+                    () => Clipboard.ContainsText() ? Clipboard.GetText() : null);
+                if (string.IsNullOrEmpty(clipboardText)) return;
+
+                var panel = ActiveTerminalPanel;
+                if (panel == null) return;
+
+                // Focus the embedded terminal before typing (mirrors SendTextViaKeystrokesAsync).
+                FocusTerminalPanel(panel);
+                await Task.Delay(60);
+                await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+                SetFocus(terminalHandle);
+                await Task.Delay(40);
+
+                // Type the clipboard text but do NOT send Enter — a paste only inserts the text.
+                TypeUnicodeText(clipboardText);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"PasteClipboardToTerminalViaKeystrokesAsync error: {ex.Message}");
             }
         }
 

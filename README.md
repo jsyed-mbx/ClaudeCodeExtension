@@ -82,6 +82,8 @@ Then choose it via *⚙ → Set Terminal Type...*.
 
 **🤖 Model menu** (Claude only): Opus / Sonnet / Haiku, effort level for Opus (Auto / Low / Medium / High / Max), Change Account, Install Caveman plugin.
 
+**On Agent Finish**: Configure via *⚙ → Settings... → On Agent Finish...*. For scripts, enable *Close script window when it finishes* to auto-close the script console. For *Run (F5)* and *Run without debugging (Ctrl+F5)*, use *Clean solution before running* and *Rebuild solution before running* to control whether the solution is prepared before launch.
+
 **Custom commands (⚡)**: Once you've added a command via *Configure Custom Commands...*, the ⚡ toolbar button appears. Clicking an entry sends the saved text verbatim to the active agent — useful for slash commands or canned prompts.
 
 ### Recipe — Codex review of uncommitted code, dispatched from Claude Code
@@ -99,6 +101,83 @@ This binds a Claude Code skill that shells out to OpenAI Codex to audit pending 
 4. **Use it**: ⚡ → *Codex Review*. Claude runs the skill, Codex audits your diff, findings appear inline.
 
 ## Version History
+
+### Version 21.0
+- Non-English text (such as Chinese, Japanese, or Korean) typed in the prompt box now reaches the terminal correctly instead of arriving as garbled characters (issue #79).
+- Agent output in the terminal is now readable under a light Visual Studio theme — accent colors like cyan and blue are painted in darker, legible tones instead of washing out against the light background (issue #80).
+
+### Version 20.0
+- Terminal zoom (Ctrl+Scroll) and right-click paste now keep working after the agent's interface is fully up, not just during startup — previously both stopped responding once the agent took over the terminal (issue #78).
+
+### Version 19.0
+- Terminal zoom (Ctrl+Scroll) and paste now keep working when signed in with a custom API key — previously some sessions left the mouse zoom and right-click paste unresponsive, and the extension now falls back automatically so both behave the same as a normal sign-in (issue #76).
+
+### Version 18.0
+- Replying to the agent's questions with the arrow keys is now reliable when "On Agent Finish" is enabled — while the agent waits for your answer the completion watcher leaves the focused terminal alone instead of fighting you for keyboard focus, so you no longer have to click the terminal repeatedly before a keystroke registers.
+
+### Version 17.0
+- Removed the Fable option from the Claude model menu — choose Opus, Sonnet, or Haiku.
+
+### Version 16.0
+- Changes to "On Agent Finish" settings now take effect for a turn that is already running — the new settings are applied when the agent finishes, instead of only on your next prompt.
+
+### Version 15.0
+- Arrow keys now work reliably while navigating the agent's question and selection menus in plan mode when "On Agent Finish" is enabled — the completion watcher recognizes the menu sooner and stays backed off as you move between options, instead of eating keystrokes.
+
+### Version 14.0
+- Fixed "Restart code agent" leaving the panel blank after an "On Agent Finish" notification had fired — previously the panel could stay broken until Visual Studio was reopened (issue #73).
+- Arrow keys and typed answers now work reliably when replying to the agent's questions in the console while "On Agent Finish" is enabled — the completion watcher now backs off while the agent waits for your reply.
+
+### Version 13.0
+- "On Agent Finish" scripts can now close their console window automatically when they finish.
+- "On Agent Finish" Run and Run without debugging actions can now clean and rebuild the solution before launching, and those preferences are saved.
+
+### Version 12.0
+- Loading or switching solutions now avoids repeated terminal attach attempts and no longer keeps retrying the same failed launch, reducing blank terminal panels after a new solution opens.
+
+### Version 11.0
+- Fixed "Restart code agent" leaving the panel blank on machines where the previous agent session shuts down slowly (issue #73) — the restart now waits for the old session to fully terminate for every provider before launching the new one, instead of only for WSL.
+- Clicking the agent terminal now reliably focuses it even when the machine is busy (issue #74) — previously the focus could be silently taken back by Visual Studio right after the click, making the terminal impossible to select while the agent was working hard.
+
+### Version 10.99
+- Fixed the agent terminal staying stuck on a previously chosen custom background color after switching the theme back to Automatic, Dark, or Light — the terminal now always matches the selected theme.
+
+### Version 10.98
+- Opening or switching solutions no longer restarts the code agent several times in a row — the agent now starts once in the right folder, which also fixes most cases of the panel coming up blank right after loading a new solution.
+- When the launch does fail to attach, the extension now waits for the old session to fully shut down and retries for longer before giving up.
+
+### Version 10.97
+- The terminal now retries the whole launch a few times when it comes up blank after "Restart code agent" or when switching solutions, recovering on its own from the brief startup failures that previously left the panel empty until you clicked restart again.
+
+### Version 10.96
+- More fixes for the panel staying blank after "Restart code agent": the panel now repairs itself when its hosting area was torn down, and attach failures show an error instead of silently leaving the panel empty until Visual Studio is reopened.
+
+### Version 10.95
+- More fixes for the terminal coming up blank after "Restart code agent": the restart now retries once when the terminal closes itself right after launch, and reports an error with a log file path instead of silently leaving the panel empty.
+
+### Version 10.94
+- Clicking the agent terminal now reliably focuses it with a single click, so you can immediately answer the agent's questions — previously it could take a second click before typing reached the terminal.
+
+### Version 10.93
+- The "On Agent Finish" run-script action now correctly runs `.cmd`/`.bat` and `.ps1` scripts and keeps their window open afterward, so you can read the output instead of the console flashing closed (or a PowerShell script just opening in an editor).
+
+### Version 10.92
+- The "On Agent Finish" notification now greys out with an explanation when Windows Terminal is selected, since it only works with the Command Prompt terminal — previously it could be enabled there but silently did nothing.
+
+### Version 10.91
+- Removed the "Don't bring Visual Studio to the foreground on terminal click" setting. Windows requires the Visual Studio window to be activated for typing to reach the embedded terminal, so the option could not work reliably and has been retired; clicking the terminal always brings Visual Studio forward again.
+
+### Version 10.90
+- Fixed the terminal coming up blank after "Restart code agent" (and other agent restarts) when an "On Agent Finish" notification was enabled — previously the panel could stay empty until Visual Studio was reopened.
+
+### Version 10.89
+- Added the new Fable model to the Claude model menu — select "Fable - Most powerful" to switch the running session to Claude's top-tier model.
+
+### Version 10.88
+- Fixed the "Don't bring Visual Studio to the foreground on terminal click" setting: clicking the terminal no longer pulls the whole Visual Studio window forward when the option is enabled, so overlapping window layouts stay intact.
+
+### Version 10.87 - ArgoZhang contribution
+- Configurable CLI executable path settings, now in a "CLI Paths" tab in the Settings window: point any provider at a specific executable, or leave it empty to use the default detection. A warning appears on save if a path doesn't exist.
 
 ### Version 10.86
 - The Prompt / Paste Image box now has a drag grip on its bottom edge so you can resize the prompt area directly without hunting for the splitter below the buttons. The grip keeps a minimum prompt size so the input stays usable.

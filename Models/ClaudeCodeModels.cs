@@ -196,6 +196,25 @@ namespace ClaudeCodeVS
         /// </summary>
         public string ScriptOrCommand { get; set; } = string.Empty;
 
+        /// <summary>
+        /// When true, script windows opened by <see cref="AgentFinishActionType.RunScript"/>
+        /// close automatically after the script finishes. When false, they stay open so
+        /// the output can be read.
+        /// </summary>
+        public bool AutoCloseScript { get; set; } = false;
+
+        /// <summary>
+        /// When true, <see cref="AgentFinishActionType.Run"/> and
+        /// <see cref="AgentFinishActionType.RunWithoutDebugging"/> clean the solution before launching.
+        /// </summary>
+        public bool CleanBeforeRun { get; set; } = true;
+
+        /// <summary>
+        /// When true, <see cref="AgentFinishActionType.Run"/> and
+        /// <see cref="AgentFinishActionType.RunWithoutDebugging"/> rebuild the solution before launching.
+        /// </summary>
+        public bool RebuildBeforeRun { get; set; } = true;
+
         /// <summary>Only run the action when the agent actually changed files (git working tree dirty).</summary>
         public bool RequireFileChanges { get; set; } = false;
 
@@ -384,6 +403,18 @@ namespace ClaudeCodeVS
         public string CustomWorkingDirectory { get; set; } = "";
 
         /// <summary>
+        /// Per-provider custom CLI executable paths, keyed by <see cref="AiProvider"/>.
+        /// When an entry is present and non-empty, it overrides the default executable
+        /// detection/launch for that provider (instead of relying on PATH or the built-in
+        /// native install location). Native providers expect a full Windows path
+        /// (e.g. C:\Tools\claude.exe); WSL providers expect a Linux path or command
+        /// (e.g. /home/user/.local/bin/claude). Empty/missing entries fall back to the
+        /// default behavior.
+        /// </summary>
+        public System.Collections.Generic.Dictionary<AiProvider, string> CustomExecutablePaths { get; set; }
+            = new System.Collections.Generic.Dictionary<AiProvider, string>();
+
+        /// <summary>
         /// Terminal emulator to use (Command Prompt or Windows Terminal)
         /// Defaults to Command Prompt for compatibility
         /// </summary>
@@ -414,16 +445,6 @@ namespace ClaudeCodeVS
         /// freeze caused by the synthesized keystrokes during startup.
         /// </summary>
         public bool DisableStartupAutoZoom { get; set; } = false;
-
-        /// <summary>
-        /// When true, clicking the embedded terminal no longer brings the entire
-        /// Visual Studio window to the foreground. Useful when overlapping multiple
-        /// VS instances or other apps and you want to click the terminal (e.g. to
-        /// grant a permission) without rearranging your window layout.
-        /// When false (the default), clicking the terminal activates the VS window
-        /// so it appears on top of other applications.
-        /// </summary>
-        public bool DisableBringToForeground { get; set; } = false;
 
         /// <summary>
         /// If true, the layout is inverted, swapping the prompt and terminal slots

@@ -143,9 +143,23 @@ namespace ClaudeCodeVS
         private readonly SemaphoreSlim _terminalLifecycleSemaphore = new SemaphoreSlim(1, 1);
 
         /// <summary>
+        /// Monotonic ticket for terminal launch requests. A launch that finds a newer ticket
+        /// after acquiring the lifecycle lock has been superseded and skips itself.
+        /// </summary>
+        private int _terminalLaunchTicket;
+
+        /// <summary>
         /// Monotonic session identifier used to discard deferred startup work from stale terminal instances.
         /// </summary>
         private int _terminalStartupSessionId = 0;
+
+        /// <summary>
+        /// PIDs of the previous terminal session's process tree that a stop issued kills for but
+        /// that may still be tearing down. Spawning a fresh conhost while these are dying makes it
+        /// exit instantly with code 0 (issue #73), so the relaunch loop re-checks this set before
+        /// every respawn. Cleared at the start of each launch request; only touched on the UI thread.
+        /// </summary>
+        private readonly HashSet<int> _pendingTeardownProcessIds = new HashSet<int>();
 
         /// <summary>
         /// Monotonic request identifier used to debounce repaint passes after manual Ctrl+Scroll zoom.
@@ -157,6 +171,14 @@ namespace ClaudeCodeVS
         /// Manual Ctrl+Scroll zoom remains available regardless of this setting.
         /// </summary>
         private static readonly bool EnableStartupTerminalAutoZoom = true;
+
+        /// <summary>
+        /// Incremented for every left-button-down the mouse hook sees (anywhere on screen).
+        /// The terminal-click focus guard (issue #74) captures the value for its click and
+        /// aborts as soon as a newer click happens, so it can never fight the user over focus.
+        /// Only touched on the UI thread.
+        /// </summary>
+        private int _terminalClickSequence;
 
         #endregion
 
@@ -449,7 +471,7 @@ namespace ClaudeCodeVS
         /// <summary>
         /// Stops the currently embedded terminal, including stale window owners left behind by wt.exe delegation.
         /// </summary>
-        private async Task StopExistingTerminalAsync()
+        private async Task StopExistingTerminalAsync(bool clearRunningProvider = true)
         {
             IntPtr existingTerminalHandle = terminalHandle;
             Process existingProcess = cmdProcess;
@@ -465,6 +487,7 @@ namespace ClaudeCodeVS
 
             if (existingTerminalHandle != IntPtr.Zero && IsWindow(existingTerminalHandle))
             {
+                LogTerminalLaunch($"stopping existing terminal: hwnd=0x{existingTerminalHandle.ToInt64():X}, windowPid={existingTerminalWindowProcessId}, isWindowsTerminal={isWindowsTerminal}");
                 PostMessage(existingTerminalHandle, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
 
                 // Windows Terminal needs more time to close the window and clean up
@@ -523,7 +546,73 @@ namespace ClaudeCodeVS
             ResetWindowsTerminalSelectionTracking();
             terminalHandle = IntPtr.Zero;
             _wtTabBarHeight = 0;
-            _currentRunningProvider = null;
+            if (clearRunningProvider)
+            {
+                _currentRunningProvider = null;
+            }
+
+            // Remember every PID this stop issued a kill for, so the relaunch loop can keep
+            // checking whether the old session has really finished dying before each respawn.
+            foreach (int killedPid in terminatedProcessIds)
+            {
+                _pendingTeardownProcessIds.Add(killedPid);
+            }
+
+            // Relaunching while the just-killed session is still tearing down is what makes the
+            // fresh conhost exit instantly with code 0 or lose its window mid-embed (issue #73).
+            // Originally observed with WSL, but the reporter's log shows the same fingerprint
+            // with native Claude Code (slow agent/node tree teardown, e.g. under corporate EDR),
+            // so wait (bounded) for the killed processes to actually disappear for ALL providers
+            // before the caller spawns the next terminal.
+            if (terminatedProcessIds.Count > 0)
+            {
+                var teardownTimer = Stopwatch.StartNew();
+                while (teardownTimer.ElapsedMilliseconds < 3000 && AnyProcessStillRunning(terminatedProcessIds))
+                {
+                    await Task.Delay(100);
+                }
+
+                if (teardownTimer.ElapsedMilliseconds >= 100)
+                {
+                    LogTerminalLaunch($"waited {teardownTimer.ElapsedMilliseconds}ms for terminal teardown" +
+                                      (AnyProcessStillRunning(terminatedProcessIds) ? " (old processes still running — proceeding anyway)" : ""));
+                }
+            }
+        }
+
+        /// <summary>
+        /// True when any of the given process IDs still maps to a running process.
+        /// </summary>
+        private static bool AnyProcessStillRunning(HashSet<int> processIds)
+        {
+            return CountProcessesStillRunning(processIds) > 0;
+        }
+
+        /// <summary>
+        /// Number of the given process IDs that still map to a running process.
+        /// </summary>
+        private static int CountProcessesStillRunning(HashSet<int> processIds)
+        {
+            int alive = 0;
+            foreach (int pid in processIds)
+            {
+                try
+                {
+                    using (var process = Process.GetProcessById(pid))
+                    {
+                        if (!process.HasExited)
+                        {
+                            alive++;
+                        }
+                    }
+                }
+                catch
+                {
+                    // Process is gone (or unreadable) — treat as exited.
+                }
+            }
+
+            return alive;
         }
 
         /// <summary>
@@ -563,7 +652,7 @@ namespace ClaudeCodeVS
             try
             {
                 terminatedProcessIds.Add(processId);
-                KillProcessAndChildren(processId);
+                KillProcessAndChildren(processId, terminatedProcessIds);
 
                 using (var process = Process.GetProcessById(processId))
                 {
@@ -820,19 +909,47 @@ namespace ClaudeCodeVS
         private async Task StartEmbeddedTerminalAsync(AiProvider? provider)
         {
             bool terminalLifecycleLockHeld = false;
+            int launchTicket = System.Threading.Interlocked.Increment(ref _terminalLaunchTicket);
 
             try
             {
                 await _terminalLifecycleSemaphore.WaitAsync();
                 terminalLifecycleLockHeld = true;
 
-                string workspaceDir = await GetWorkspaceDirectoryAsync();
-                if (string.IsNullOrEmpty(workspaceDir))
+                // While this request waited for the lifecycle lock, a newer launch request was
+                // queued behind it. Starting a terminal here would only have the queued request
+                // immediately tear it down and relaunch — the WSL stop/start churn behind the
+                // blank-panel failures (issue #73). Let the newest request do the work.
+                if (launchTicket != System.Threading.Volatile.Read(ref _terminalLaunchTicket))
                 {
-                    workspaceDir = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+                    LogTerminalLaunch($"skipping superseded launch request: provider={(provider?.ToString() ?? "CMD")}");
+                    return;
                 }
 
+                string workspaceDir = NormalizeWorkspaceDirectory(await GetWorkspaceDirectoryAsync());
+                if (string.IsNullOrEmpty(workspaceDir))
+                {
+                    workspaceDir = NormalizeWorkspaceDirectory(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments));
+                }
+
+                _lastTerminalLaunchWorkspaceDirectory = workspaceDir;
                 _lastWorkspaceDirectory = workspaceDir;
+
+                // Stop the agent-finish watcher and clear any stale notification before tearing
+                // the old terminal down. Its 1-second console-attach tick can otherwise overlap
+                // the teardown/relaunch below and leave VS attached to the dying console — the
+                // new conhost then fails to create its window and the panel comes up blank
+                // (issue #73: "Restart code agent" showing nothing until VS is reopened).
+                await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+                ResetAgentCompletionWatcher();
+
+                // Revive the low-level input hooks if their thread died — terminal click
+                // activation/focus (issue #74) and F5 forwarding stop working without them,
+                // and nothing else restarts the thread after a failure.
+                StartHookThread();
+
+                // Track teardown of the session being replaced for this launch request only.
+                _pendingTeardownProcessIds.Clear();
 
                 await StopExistingTerminalAsync();
 
@@ -886,7 +1003,8 @@ namespace ClaudeCodeVS
                             break;
 
                         case AiProvider.OpenCode:
-                            cmdCommand = $"/k chcp 65001 >nul && cd /d \"{workspaceDir}\" && ping localhost -n 3 >nul && cls && opencode";
+                            string openCodeCommand = ResolveProviderExecutable(AiProvider.OpenCode, "opencode");
+                            cmdCommand = $"/k chcp 65001 >nul && cd /d \"{workspaceDir}\" && ping localhost -n 3 >nul && cls && {openCodeCommand}";
                             break;
 
                         case AiProvider.Windsurf:
@@ -896,7 +1014,8 @@ namespace ClaudeCodeVS
                             break;
 
                         case AiProvider.Pi:
-                            cmdCommand = $"/k chcp 65001 >nul && cd /d \"{workspaceDir}\" && ping localhost -n 3 >nul && cls && pi";
+                            string piCommand = ResolveProviderExecutable(AiProvider.Pi, "pi");
+                            cmdCommand = $"/k chcp 65001 >nul && cd /d \"{workspaceDir}\" && ping localhost -n 3 >nul && cls && {piCommand}";
                             break;
 
                         case AiProvider.Antigravity:
@@ -937,16 +1056,20 @@ namespace ClaudeCodeVS
                         wtStartInfo.EnvironmentVariables["PATH"] = freshPath;
                     }
 
+                    LogTerminalLaunch($"Launching Windows Terminal: provider={(provider?.ToString() ?? "CMD")}, workspace={workspaceDir}");
+
                     await Task.Run(() =>
                     {
                         try
                         {
                             cmdProcess = new Process { StartInfo = wtStartInfo };
                             cmdProcess.Start();
+                            LogTerminalLaunch($"wt.exe spawned: pid={cmdProcess.Id}");
                         }
                         catch (Exception ex)
                         {
                             Debug.WriteLine($"Error starting Windows Terminal process: {ex.Message}");
+                            LogTerminalLaunch($"wt.exe spawn FAILED: {ex.Message}");
                             throw;
                         }
                     });
@@ -964,8 +1087,9 @@ namespace ClaudeCodeVS
 
                     if (terminalHandle != IntPtr.Zero && IsWindow(terminalHandle))
                     {
-                        if (terminalPanel?.Handle == null || terminalPanel.Handle == IntPtr.Zero)
+                        if (!EnsureTerminalPanelReady())
                         {
+                            LogTerminalLaunch("ABORT: terminal panel not ready — WT launch abandoned");
                             return;
                         }
 
@@ -977,19 +1101,41 @@ namespace ClaudeCodeVS
                             ApplyEmbeddedTerminalWindowStyle(forceChildWindowStyle: true);
 
                             // Embed the window with retry — SetParent can fail transiently
-                            // on busy systems or when the window is not yet ready
-                            IntPtr wtPrevParent = IntPtr.Zero;
+                            // on busy systems or when the window is not yet ready. SetParent
+                            // returning zero is ambiguous (a top-level window's previous parent
+                            // is also zero), so confirm via GetParent before declaring failure.
+                            bool wtEmbedSucceeded = false;
                             for (int spAttempt = 1; spAttempt <= 3; spAttempt++)
                             {
-                                wtPrevParent = SetParent(terminalHandle, terminalPanel.Handle);
-                                if (wtPrevParent != IntPtr.Zero)
-                                    break;
-
+                                IntPtr wtPrevParent = SetParent(terminalHandle, terminalPanel.Handle);
                                 int err = Marshal.GetLastWin32Error();
+                                if (wtPrevParent != IntPtr.Zero || GetParent(terminalHandle) == terminalPanel.Handle)
+                                {
+                                    wtEmbedSucceeded = true;
+                                    break;
+                                }
+
                                 Debug.WriteLine($"SetParent failed for WT (attempt {spAttempt}/3, win32 error {err}) -- retrying after 200ms");
+                                LogTerminalLaunch($"SetParent failed for WT (attempt {spAttempt}/3, win32 error {err})");
                                 await Task.Delay(200);
                                 ApplyEmbeddedTerminalWindowStyle(forceChildWindowStyle: true);
                             }
+
+                            if (!wtEmbedSucceeded)
+                            {
+                                // Don't continue as if embedded — that leaves a hidden, parentless
+                                // window and a blank panel (issue #73). The next restart closes
+                                // the orphan via terminalHandle.
+                                LogTerminalLaunch("FAILED: SetParent never succeeded for WT — panel left blank");
+                                MessageBox.Show(
+                                    "The terminal started but could not be attached to the panel.\n\n" +
+                                    "Please try \"Restart code agent\" again. If the problem persists, report it with the log file:\n" +
+                                    TerminalLaunchLogPath,
+                                    "Claude Code Extension", MessageBoxButton.OK, MessageBoxImage.Warning);
+                                return;
+                            }
+
+                            LogTerminalLaunch($"embedded OK (WT): hwnd=0x{terminalHandle.ToInt64():X}");
 
                             // Calculate tab bar height
                             _wtTabBarHeight = GetWtTabBarHeight();
@@ -1027,6 +1173,7 @@ namespace ClaudeCodeVS
                     }
                     else
                     {
+                        LogTerminalLaunch("FAILED: no Windows Terminal window found to embed — panel left blank");
                         throw new InvalidOperationException("Failed to find Windows Terminal window");
                     }
                 }
@@ -1073,7 +1220,8 @@ namespace ClaudeCodeVS
                             break;
 
                         case AiProvider.OpenCode:
-                            terminalCommand = $"/k chcp 65001 >nul && cd /d \"{workspaceDir}\" && ping localhost -n 3 >nul && cls && opencode";
+                            string openCodeTerminalCommand = ResolveProviderExecutable(AiProvider.OpenCode, "opencode");
+                            terminalCommand = $"/k chcp 65001 >nul && cd /d \"{workspaceDir}\" && ping localhost -n 3 >nul && cls && {openCodeTerminalCommand}";
                             break;
 
                         case AiProvider.Windsurf:
@@ -1083,7 +1231,8 @@ namespace ClaudeCodeVS
                             break;
 
                         case AiProvider.Pi:
-                            terminalCommand = $"/k chcp 65001 >nul && cd /d \"{workspaceDir}\" && ping localhost -n 3 >nul && cls && pi";
+                            string piTerminalCommand = ResolveProviderExecutable(AiProvider.Pi, "pi");
+                            terminalCommand = $"/k chcp 65001 >nul && cd /d \"{workspaceDir}\" && ping localhost -n 3 >nul && cls && {piTerminalCommand}";
                             break;
 
                         case AiProvider.Antigravity:
@@ -1124,50 +1273,163 @@ namespace ClaudeCodeVS
                     SaveAndSetConsoleColorsRegistry();
                     SaveAndSetConsoleFontRegistry();
 
-                    await Task.Run(() =>
+                    LogTerminalLaunch($"Launching conhost terminal: provider={(provider?.ToString() ?? "CMD")}, workspace={workspaceDir}");
+
+                    // The freshly-launched conhost/cmd can die within a few hundred ms when WSL is
+                    // still tearing down a just-stopped session (issue #73): the console window
+                    // either never appears ("exited immediately, exitCode=0") or dies right after, so
+                    // SetParent then hits a dead window (win32 error 1400). Both clear on a retry a
+                    // moment later, so relaunch the whole spawn->find->embed unit a few times with
+                    // growing backoff before giving up and leaving the panel blank.
+                    bool embedded = false;
+                    bool superseded = false;
+                    string lastFailureReason = "no console window to embed";
+                    int[] relaunchBackoffMs = { 0, 750, 1500, 3000, 6000 };
+                    for (int relaunch = 0; relaunch < relaunchBackoffMs.Length && !embedded; relaunch++)
                     {
-                        try
+                        if (relaunch > 0)
                         {
-                            cmdProcess = new Process { StartInfo = startInfo };
-                            cmdProcess.Start();
+                            // A newer launch request queued up while this one was retrying —
+                            // stop burning backoff time on a doomed session and let it run.
+                            if (launchTicket != System.Threading.Volatile.Read(ref _terminalLaunchTicket))
+                            {
+                                superseded = true;
+                                LogTerminalLaunch($"abandoning relaunch retries: superseded by a newer launch request (relaunch {relaunch + 1}/{relaunchBackoffMs.Length})");
+                                break;
+                            }
+
+                            // Clean up the orphan window/process from the failed attempt so retries
+                            // don't pile up live conhosts, then back off to let the teardown settle.
+                            await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+                            await StopExistingTerminalAsync(clearRunningProvider: false);
+                            LogTerminalLaunch($"relaunching after embed failure ({lastFailureReason}); relaunch {relaunch + 1}/{relaunchBackoffMs.Length} after {relaunchBackoffMs[relaunch]}ms backoff");
+                            await Task.Delay(relaunchBackoffMs[relaunch]);
+
+                            // An instant-exit attempt leaves nothing of its own to wait on, but the
+                            // ORIGINAL session's process tree may still be dying — and spawning into
+                            // that teardown is exactly what kills the fresh conhost (issue #73).
+                            // Hold this respawn (bounded) until the old tree is actually gone.
+                            int teardownStillAlive = CountProcessesStillRunning(_pendingTeardownProcessIds);
+                            if (teardownStillAlive > 0)
+                            {
+                                var respawnGateTimer = Stopwatch.StartNew();
+                                while (respawnGateTimer.ElapsedMilliseconds < 5000 &&
+                                       AnyProcessStillRunning(_pendingTeardownProcessIds))
+                                {
+                                    await Task.Delay(150);
+                                }
+
+                                LogTerminalLaunch($"waited extra {respawnGateTimer.ElapsedMilliseconds}ms for {teardownStillAlive} old terminal process(es) to exit before respawn" +
+                                                  (AnyProcessStillRunning(_pendingTeardownProcessIds) ? " (still running — proceeding anyway)" : ""));
+                            }
                         }
-                        catch (Exception ex)
+
+                        // Spawn the terminal and locate its console window. If the conhost dies right
+                        // after launch (a console window flashes for a split second, closes itself,
+                        // and the panel stays blank), re-spawn once before deferring to the relaunch.
+                        IntPtr hwnd = IntPtr.Zero;
+                        for (int spawnAttempt = 1; spawnAttempt <= 2 && hwnd == IntPtr.Zero; spawnAttempt++)
                         {
-                            Debug.WriteLine($"Error starting process: {ex.Message}");
-                            throw;
+                            await Task.Run(() =>
+                            {
+                                // Serialize the spawn against the agent-finish console capture and detach
+                                // VS from any console right before CreateProcess. A child spawned while VS
+                                // is attached to a console inherits it instead of creating its own window,
+                                // which leaves the embedded terminal permanently blank (issue #73). The
+                                // bounded acquire keeps a pathological hung capture from blocking the
+                                // launch forever — FreeConsole still runs so the spawn never inherits.
+                                bool consoleLockTaken = false;
+                                try
+                                {
+                                    Monitor.TryEnter(_consoleSnapshotLock, 5000, ref consoleLockTaken);
+                                    bool vsHadConsole = GetConsoleWindow() != IntPtr.Zero;
+                                    try { FreeConsole(); } catch { }
+                                    // The agent-finish console capture replaces VS's standard
+                                    // handles via AttachConsole, and FreeConsole leaves them
+                                    // dangling once the old console dies. A conhost spawned with
+                                    // those dead values inherited exits immediately with code 0
+                                    // and the panel stays blank until VS is reopened (issue #73),
+                                    // so put the originals back right before CreateProcess.
+                                    bool stdHandlesWereDirty = RestoreOriginalStdHandles();
+
+                                    cmdProcess = new Process { StartInfo = startInfo };
+                                    cmdProcess.Start();
+                                    LogTerminalLaunch($"conhost spawned: pid={cmdProcess.Id}, attempt={spawnAttempt}/2, vsHadConsoleAttached={vsHadConsole}, stdHandlesWereDirty={stdHandlesWereDirty}, spawnLockTaken={consoleLockTaken}");
+                                }
+                                catch (Exception ex)
+                                {
+                                    Debug.WriteLine($"Error starting process: {ex.Message}");
+                                    LogTerminalLaunch($"conhost spawn FAILED: {ex.Message}");
+                                    throw;
+                                }
+                                finally
+                                {
+                                    if (consoleLockTaken) Monitor.Exit(_consoleSnapshotLock);
+                                }
+                            });
+
+                            if (cmdProcess == null)
+                            {
+                                throw new InvalidOperationException("Failed to create terminal process");
+                            }
+
+                            // Find the terminal window with retry -- on busy systems the first
+                            // attempt may time out before cmd.exe creates its window, leaving a floating
+                            // external window. Retry with a longer timeout before giving up.
+                            int[] findTimeouts = { 5000, 10000 }; // 5s, then 10s retry
+                            for (int findAttempt = 0; findAttempt < findTimeouts.Length; findAttempt++)
+                            {
+                                hwnd = await FindMainWindowHandleByConhostAsync(cmdProcess.Id, timeoutMs: findTimeouts[findAttempt], pollIntervalMs: 50, launcherProcess: cmdProcess);
+                                if (hwnd != IntPtr.Zero)
+                                    break;
+                                if (HasTerminalProcessExited(cmdProcess))
+                                    break; // dead launcher — no point polling for its window
+                                Debug.WriteLine($"FindMainWindowHandleByConhostAsync attempt {findAttempt + 1} timed out after {findTimeouts[findAttempt]}ms, retrying...");
+                                LogTerminalLaunch($"console window not found after {findTimeouts[findAttempt]}ms (find attempt {findAttempt + 1}), process still alive");
+                            }
+
+                            if (hwnd == IntPtr.Zero)
+                            {
+                                if (!HasTerminalProcessExited(cmdProcess))
+                                {
+                                    // The launcher is alive but its window was never found — do not
+                                    // re-spawn (that would pile up a second live terminal process).
+                                    LogTerminalLaunch("giving up: conhost is running but its console window was never found");
+                                    break;
+                                }
+
+                                int exitCode = 0;
+                                try { exitCode = cmdProcess.ExitCode; } catch { }
+                                // oldSessionProcsAlive confirms (or rules out) the teardown-contention
+                                // cause from a user's log alone: >0 means the previous session's tree
+                                // was still dying when this spawn was killed (issue #73).
+                                LogTerminalLaunch($"conhost exited immediately after launch: exitCode={exitCode}, attempt={spawnAttempt}/2, oldSessionProcsAlive={CountProcessesStillRunning(_pendingTeardownProcessIds)}");
+                                try { cmdProcess.Dispose(); } catch { }
+                                cmdProcess = null;
+                                if (spawnAttempt < 2)
+                                {
+                                    await Task.Delay(500);
+                                }
+                            }
                         }
-                    });
 
-                    if (cmdProcess == null)
-                    {
-                        throw new InvalidOperationException("Failed to create terminal process");
-                    }
+                        terminalHandle = hwnd;
 
-                    // Find and embed the terminal window with retry -- on busy systems the first
-                    // attempt may time out before cmd.exe creates its window, leaving a floating
-                    // external window. Retry with a longer timeout before giving up.
-                    IntPtr hwnd = IntPtr.Zero;
-                    int[] findTimeouts = { 5000, 10000 }; // 5s, then 10s retry
-                    for (int findAttempt = 0; findAttempt < findTimeouts.Length; findAttempt++)
-                    {
-                        hwnd = await FindMainWindowHandleByConhostAsync(cmdProcess.Id, timeoutMs: findTimeouts[findAttempt], pollIntervalMs: 50);
-                        if (hwnd != IntPtr.Zero)
-                            break;
-                        Debug.WriteLine($"FindMainWindowHandleByConhostAsync attempt {findAttempt + 1} timed out after {findTimeouts[findAttempt]}ms, retrying...");
-                    }
+                        await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
 
-                    // Restore original console font and colors
-                    RestoreConsoleFontRegistry();
-                    RestoreConsoleColorsRegistry();
-
-                    terminalHandle = hwnd;
-
-                    await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
-
-                    if (terminalHandle != IntPtr.Zero && IsWindow(terminalHandle))
-                    {
-                        if (terminalPanel?.Handle == null || terminalPanel.Handle == IntPtr.Zero)
+                        if (terminalHandle == IntPtr.Zero || !IsWindow(terminalHandle))
                         {
+                            // No window to embed this attempt — relaunch (or report after the loop).
+                            lastFailureReason = "no console window to embed";
+                            LogTerminalLaunch($"no console window to embed (relaunch {relaunch + 1}/{relaunchBackoffMs.Length})");
+                            continue;
+                        }
+
+                        if (!EnsureTerminalPanelReady())
+                        {
+                            LogTerminalLaunch("ABORT: terminal panel not ready — launch abandoned");
+                            RestoreConsoleFontRegistry();
+                            RestoreConsoleColorsRegistry();
                             return;
                         }
 
@@ -1179,19 +1441,48 @@ namespace ClaudeCodeVS
                             ApplyEmbeddedTerminalWindowStyle(forceChildWindowStyle: false);
 
                             // Embed the window with retry — SetParent can fail transiently
-                            // on busy systems or when the window is not yet ready
-                            IntPtr prevParent = IntPtr.Zero;
+                            // on busy systems or when the window is not yet ready. SetParent
+                            // returning zero is ambiguous (a top-level window's previous parent
+                            // is also zero), so confirm via GetParent before declaring failure.
+                            bool embedSucceeded = false;
+                            bool windowDied = false;
                             for (int spAttempt = 1; spAttempt <= 3; spAttempt++)
                             {
-                                prevParent = SetParent(terminalHandle, terminalPanel.Handle);
-                                if (prevParent != IntPtr.Zero)
+                                // The conhost can die mid-embed when WSL is tearing down (issue #73);
+                                // SetParent then fails with win32 error 1400 on a dead window. Detect
+                                // the corpse up front so we relaunch at once instead of burning 600ms
+                                // retrying SetParent against a window that will never come back.
+                                if (!IsWindow(terminalHandle) || HasTerminalProcessExited(cmdProcess))
+                                {
+                                    windowDied = true;
+                                    LogTerminalLaunch($"console window/process died before embed (relaunch {relaunch + 1}/{relaunchBackoffMs.Length})");
                                     break;
+                                }
 
+                                IntPtr prevParent = SetParent(terminalHandle, terminalPanel.Handle);
                                 int err = Marshal.GetLastWin32Error();
+                                if (prevParent != IntPtr.Zero || GetParent(terminalHandle) == terminalPanel.Handle)
+                                {
+                                    embedSucceeded = true;
+                                    break;
+                                }
+
                                 Debug.WriteLine($"SetParent failed (attempt {spAttempt}/3, win32 error {err}) -- retrying after 200ms");
+                                LogTerminalLaunch($"SetParent failed (attempt {spAttempt}/3, win32 error {err})");
                                 await Task.Delay(200);
                                 ApplyEmbeddedTerminalWindowStyle(forceChildWindowStyle: false);
                             }
+
+                            if (!embedSucceeded)
+                            {
+                                // Don't claim success and show a hidden, parentless window — that is
+                                // the blank panel with the agent running invisibly (issue #73). Defer
+                                // to the relaunch loop; the orphan is cleaned up before the next try.
+                                lastFailureReason = windowDied ? "console window died before embed" : "SetParent never succeeded";
+                                continue;
+                            }
+
+                            LogTerminalLaunch($"embedded OK: hwnd=0x{terminalHandle.ToInt64():X}");
 
                             // Now show it in the embedded context
                             ShowWindow(terminalHandle, SW_SHOW);
@@ -1217,6 +1508,7 @@ namespace ClaudeCodeVS
                             RecordTerminalAgentColor();
 
                             SchedulePostStartupTerminalAdjustments();
+                            embedded = true;
                         }
                         catch (Exception ex)
                         {
@@ -1224,14 +1516,30 @@ namespace ClaudeCodeVS
                             throw;
                         }
                     }
-                    else
+
+                    // Restore original console font and colors. These are kept set across all
+                    // relaunch attempts (saved once before the loop) so every conhost picks up the
+                    // themed colors at startup — re-saving per attempt would clobber the originals.
+                    RestoreConsoleFontRegistry();
+                    RestoreConsoleColorsRegistry();
+
+                    if (!embedded && !superseded)
                     {
-                        Debug.WriteLine("Could not find CMD window to embed. Terminal may not be available.");
+                        // Every relaunch attempt left the panel blank (issue #73). Tell the user
+                        // where the launch log is so the failure can be reported with details.
+                        Debug.WriteLine("Could not embed CMD window after relaunch attempts. Terminal may not be available.");
+                        LogTerminalLaunch("FAILED: panel left blank after all relaunch attempts — " + lastFailureReason);
+                        MessageBox.Show(
+                            "The terminal could not be attached to the panel.\n\n" +
+                            "Please try \"Restart code agent\" again. If the problem persists, report it with the log file:\n" +
+                            TerminalLaunchLogPath,
+                            "Claude Code Extension", MessageBoxButton.OK, MessageBoxImage.Warning);
                     }
                 }
             }
             catch (Exception ex)
             {
+                LogTerminalLaunch($"FAILED with exception: {ex.Message}");
                 await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
                 MessageBox.Show($"Failed to start embedded terminal: {ex.Message}",
                                 "Error", MessageBoxButton.OK, MessageBoxImage.Error);
@@ -1290,14 +1598,11 @@ namespace ClaudeCodeVS
         private object _savedConsolePopupColors;
 
         /// <summary>
-        /// Saved original console ColorTable00 (black) from registry
+        /// Saved original console ColorTable00..ColorTable15 from registry, for restoration
+        /// after conhost starts. All 16 ANSI palette slots are tracked because the light-theme
+        /// fix (issue #80) rewrites the accent slots, not just background/foreground.
         /// </summary>
-        private object _savedConsoleColorTable00;
-
-        /// <summary>
-        /// Saved original console ColorTable07 (white) from registry
-        /// </summary>
-        private object _savedConsoleColorTable07;
+        private readonly object[] _savedConsoleColorTable = new object[16];
 
         /// <summary>
         /// Whether we have saved console color values that need restoration
@@ -1432,20 +1737,32 @@ namespace ClaudeCodeVS
         {
             try
             {
-                // Custom theme: paint the console background with the user-chosen
-                // color (bg = ColorTable00, fg = ColorTable07 black/white by brightness).
-                bool isCustom = _settings?.SelectedThemePreference == ThemePreference.Custom;
-                System.Drawing.Color customColor = isCustom ? GetCustomThemeColor() : System.Drawing.Color.Black;
-                bool customIsLight = isCustom && Brightness(customColor) > 150;
+                // If a previous launch saved the originals but never restored them
+                // (e.g. a superseded/aborted launch during the issue #73 relaunch
+                // churn), recover the true user values first. Otherwise the next
+                // save would capture our own temporary themed color as the
+                // "original" and bake it in permanently -- every later restore
+                // would then write that color back, so a non-custom theme would
+                // keep showing the old custom background forever.
+                if (_consoleColorsSaved)
+                    RestoreConsoleColorsRegistry();
+
+                // Paint the console background with the current theme's background
+                // color for ALL themes (custom/dark/light/automatic). ColorTable00
+                // is written explicitly every time so a non-custom theme can never
+                // inherit a stale ColorTable00 left behind by a previous custom run.
+                // bg = ColorTable00, fg = ColorTable07 (black/white by brightness),
+                // ScreenColors low nibble = fg index 7, high nibble = bg index 0.
+                System.Drawing.Color bgColor = GetTerminalBackgroundColor();
+                bool bgIsLight = Brightness(bgColor) > 150;
                 // Console color tables store BGR (0x00BBGGRR).
-                uint customBgr = (uint)((customColor.B << 16) | (customColor.G << 8) | customColor.R);
+                uint bgBgr = (uint)((bgColor.B << 16) | (bgColor.G << 8) | bgColor.R);
+                uint fgBgr = bgIsLight ? 0x00000000U : 0x00FFFFFFU; // black on light, white on dark
 
-                bool isLightTheme = isCustom ? customIsLight : IsVsInLightTheme();
-                Debug.WriteLine($"SaveAndSetConsoleColorsRegistry - isCustom: {isCustom}, isLightTheme: {isLightTheme}");
-
-                // For custom: bg index 0 (ColorTable00 = custom), fg index 7 (ColorTable07).
-                uint screenColors = isCustom ? 0x07U : (isLightTheme ? 0xF0U : 0x0FU);
+                uint screenColors = 0x07U; // bg index 0 (ColorTable00), fg index 7 (ColorTable07)
                 uint popupColors = screenColors;
+
+                Debug.WriteLine($"SaveAndSetConsoleColorsRegistry - bg=#{bgColor.R:X2}{bgColor.G:X2}{bgColor.B:X2}, bgIsLight: {bgIsLight}");
 
                 using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey("Console", writable: true))
                 {
@@ -1455,28 +1772,18 @@ namespace ClaudeCodeVS
                         return;
                     }
 
-                    // Save original colors
+                    // Save original colors (all 16 palette slots, so the light-theme accent
+                    // overrides below can be reverted cleanly).
                     _savedConsoleScreenColors = key.GetValue("ScreenColors");
                     _savedConsolePopupColors = key.GetValue("PopupColors");
-                    _savedConsoleColorTable00 = key.GetValue("ColorTable00");
-                    _savedConsoleColorTable07 = key.GetValue("ColorTable07");
+                    for (int i = 0; i < 16; i++)
+                        _savedConsoleColorTable[i] = key.GetValue($"ColorTable{i:D2}");
                     _consoleColorsSaved = true;
                     Debug.WriteLine($"Saved original ScreenColors: {_savedConsoleScreenColors}");
 
                     key.SetValue("ScreenColors", screenColors, Microsoft.Win32.RegistryValueKind.DWord);
                     key.SetValue("PopupColors", popupColors, Microsoft.Win32.RegistryValueKind.DWord);
-
-                    if (isCustom)
-                    {
-                        key.SetValue("ColorTable00", customBgr, Microsoft.Win32.RegistryValueKind.DWord); // custom background
-                        key.SetValue("ColorTable07", customIsLight ? 0x00000000U : 0x00FFFFFFU, Microsoft.Win32.RegistryValueKind.DWord); // black/white text
-                    }
-                    else if (isLightTheme)
-                    {
-                        // Set explicit RGB values for color table entries
-                        key.SetValue("ColorTable00", 0x00000000U, Microsoft.Win32.RegistryValueKind.DWord); // Black
-                        key.SetValue("ColorTable07", 0x00FFFFFFU, Microsoft.Win32.RegistryValueKind.DWord); // White
-                    }
+                    WriteThemedConsolePalette(key, bgBgr, fgBgr, bgIsLight);
 
                     Debug.WriteLine($"Set ScreenColors to: {screenColors:X}");
                 }
@@ -1488,11 +1795,7 @@ namespace ClaudeCodeVS
                     {
                         conhostKey.SetValue("ScreenColors", screenColors, Microsoft.Win32.RegistryValueKind.DWord);
                         conhostKey.SetValue("PopupColors", popupColors, Microsoft.Win32.RegistryValueKind.DWord);
-                        if (isCustom)
-                        {
-                            conhostKey.SetValue("ColorTable00", customBgr, Microsoft.Win32.RegistryValueKind.DWord);
-                            conhostKey.SetValue("ColorTable07", customIsLight ? 0x00000000U : 0x00FFFFFFU, Microsoft.Win32.RegistryValueKind.DWord);
-                        }
+                        WriteThemedConsolePalette(conhostKey, bgBgr, fgBgr, bgIsLight);
                         Debug.WriteLine($"Set conhost ScreenColors to: {screenColors:X}");
                     }
                 }
@@ -1505,6 +1808,63 @@ namespace ClaudeCodeVS
             {
                 Debug.WriteLine($"SaveAndSetConsoleColorsRegistry error: {ex.Message}\n{ex.StackTrace}");
             }
+        }
+
+        /// <summary>
+        /// Writes the themed background (ColorTable00) and foreground (ColorTable07) into a console
+        /// registry key. On a LIGHT background the 14 accent slots (ColorTable01-06 and 08-15) ship
+        /// tuned for a dark background and wash out (issue #80), so a light-appropriate full palette
+        /// of darker/saturated accent colors is painted instead. On a dark background the default
+        /// accent slots are left untouched.
+        /// </summary>
+        private void WriteThemedConsolePalette(Microsoft.Win32.RegistryKey key, uint bgBgr, uint fgBgr, bool bgIsLight)
+        {
+            key.SetValue("ColorTable00", bgBgr, Microsoft.Win32.RegistryValueKind.DWord); // themed background
+            key.SetValue("ColorTable07", fgBgr, Microsoft.Win32.RegistryValueKind.DWord); // black/white text
+
+            if (!bgIsLight)
+                return;
+
+            // Accent slots only (skip 00 = background and 07 = foreground, already set above).
+            uint[] palette = GetLightConsolePalette();
+            for (int i = 1; i < 16; i++)
+            {
+                if (i == 7) continue;
+                key.SetValue($"ColorTable{i:D2}", palette[i], Microsoft.Win32.RegistryValueKind.DWord);
+            }
+        }
+
+        /// <summary>
+        /// Returns a 16-entry ANSI palette (BGR, 0x00BBGGRR) with darker/saturated accent colors that
+        /// stay legible on a light console background. The "bright" slots (09-14) mirror their normal
+        /// counterparts so agent TUIs that emit bright accents (e.g. cyan inline code) remain readable.
+        /// Slots 00 (background) and 07 (foreground) are placeholders; callers override them with the
+        /// active theme colors.
+        /// </summary>
+        private static uint[] GetLightConsolePalette()
+        {
+            // Local helper: pack R,G,B into the console's BGR DWORD layout.
+            uint Bgr(byte r, byte g, byte b) => (uint)((b << 16) | (g << 8) | r);
+
+            return new uint[16]
+            {
+                Bgr(0xFF, 0xFF, 0xFF), // 00 black/background (overridden by caller)
+                Bgr(0xC5, 0x0F, 0x1F), // 01 red
+                Bgr(0x0E, 0x7A, 0x0E), // 02 green
+                Bgr(0x94, 0x6A, 0x00), // 03 yellow (dark amber)
+                Bgr(0x00, 0x37, 0xDA), // 04 blue
+                Bgr(0x88, 0x17, 0x98), // 05 magenta
+                Bgr(0x0E, 0x80, 0x80), // 06 cyan (teal)
+                Bgr(0x00, 0x00, 0x00), // 07 white/foreground (overridden by caller)
+                Bgr(0x76, 0x76, 0x76), // 08 bright black (gray)
+                Bgr(0xC5, 0x0F, 0x1F), // 09 bright red
+                Bgr(0x0E, 0x7A, 0x0E), // 10 bright green
+                Bgr(0x94, 0x6A, 0x00), // 11 bright yellow
+                Bgr(0x00, 0x37, 0xDA), // 12 bright blue
+                Bgr(0x88, 0x17, 0x98), // 13 bright magenta
+                Bgr(0x0E, 0x80, 0x80), // 14 bright cyan
+                Bgr(0x26, 0x26, 0x26), // 15 bright white (dark gray on light bg)
+            };
         }
 
         /// <summary>
@@ -1532,16 +1892,15 @@ namespace ClaudeCodeVS
                         else
                             key.DeleteValue("PopupColors", throwOnMissingValue: false);
 
-                        // Restore color table entries (only for light theme which sets them)
-                        if (_savedConsoleColorTable00 != null)
-                            key.SetValue("ColorTable00", _savedConsoleColorTable00, Microsoft.Win32.RegistryValueKind.DWord);
-                        else
-                            key.DeleteValue("ColorTable00", throwOnMissingValue: false);
-
-                        if (_savedConsoleColorTable07 != null)
-                            key.SetValue("ColorTable07", _savedConsoleColorTable07, Microsoft.Win32.RegistryValueKind.DWord);
-                        else
-                            key.DeleteValue("ColorTable07", throwOnMissingValue: false);
+                        // Restore all 16 color table entries to their original state
+                        for (int i = 0; i < 16; i++)
+                        {
+                            string name = $"ColorTable{i:D2}";
+                            if (_savedConsoleColorTable[i] != null)
+                                key.SetValue(name, _savedConsoleColorTable[i], Microsoft.Win32.RegistryValueKind.DWord);
+                            else
+                                key.DeleteValue(name, throwOnMissingValue: false);
+                        }
                     }
                 }
 
@@ -1552,8 +1911,8 @@ namespace ClaudeCodeVS
                     {
                         conhostKey.DeleteValue("ScreenColors", throwOnMissingValue: false);
                         conhostKey.DeleteValue("PopupColors", throwOnMissingValue: false);
-                        conhostKey.DeleteValue("ColorTable00", throwOnMissingValue: false);
-                        conhostKey.DeleteValue("ColorTable07", throwOnMissingValue: false);
+                        for (int i = 0; i < 16; i++)
+                            conhostKey.DeleteValue($"ColorTable{i:D2}", throwOnMissingValue: false);
                     }
                 }
 
@@ -1654,7 +2013,13 @@ namespace ClaudeCodeVS
                 {
                     frame = _toolWindow.Frame as IVsWindowFrame;
                 }
-                frame?.Show();
+
+                if (frame == null)
+                {
+                    return;
+                }
+
+                frame.Show();
             }
             catch (Exception ex)
             {
@@ -1773,19 +2138,11 @@ namespace ClaudeCodeVS
                 }
                 else
                 {
-                    // Command Prompt: PostMessage WM_MOUSEWHEEL+MK_CONTROL directly to
-                    // the terminal handle — no focus dependency needed.
-                    var screenPt = panel.PointToScreen(
-                        new System.Drawing.Point(panel.Width / 2, panel.Height / 2));
-                    int lParam = (screenPt.Y << 16) | (screenPt.X & 0xFFFF);
-                    int notch = delta > 0 ? 120 : -120;
-
-                    for (int i = 0; i < steps; i++)
-                    {
-                        int wParam = (notch << 16) | 0x0008; // HIWORD=delta, LOWORD=MK_CONTROL
-                        PostMessage(terminalHandle, WM_MOUSEWHEEL, (IntPtr)wParam, (IntPtr)lParam);
-                        await Task.Delay(40);
-                    }
+                    // Command Prompt: set the console font size directly (issue #76/#78). Posting
+                    // WM_MOUSEWHEEL would be swallowed if the agent's TUI is already in mouse-input
+                    // mode by the time the replay fires, so apply the saved delta the same
+                    // input-mode-independent way the interactive zoom now does.
+                    await Task.Run(() => TryAdjustConhostFontSize(delta));
                 }
 
                 await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
@@ -2101,7 +2458,18 @@ namespace ClaudeCodeVS
 
         /// <summary>
         /// Reacts to a click on the embedded terminal panel: makes sure VS is on top of the
-        /// Win32 Z-order and that our tool window is the active pane inside VS.
+        /// Win32 Z-order and that our tool window is the active pane inside VS, then keeps
+        /// keyboard focus on the terminal until the activation dust settles.
+        ///
+        /// The click itself focuses the terminal natively, but the activation steps
+        /// (SetForegroundWindow and IVsWindowFrame.Show) make VS move keyboard focus into the
+        /// WPF tool-window content a moment later, silently stealing it from the terminal
+        /// (issue #74). The original fix re-asserted focus exactly twice at fixed 80ms delays —
+        /// on a heavily loaded machine (an agent crunching while VS repaints) VS's focus restore
+        /// can land *after* both asserts, so every click appeared to do nothing and the terminal
+        /// became impossible to select. The guard now verifies and re-asserts focus repeatedly
+        /// for ~1.6s, aborting the moment the user clicks anywhere else or leaves VS, so a click
+        /// on the terminal reliably ends with the terminal focused regardless of timing.
         /// </summary>
         private void ActivateEmbeddedTerminalOnClick(POINT screenPoint)
         {
@@ -2113,36 +2481,98 @@ namespace ClaudeCodeVS
             }
 
             // Verify the click really hit the terminal (not another app fully covering VS at the
-            // same screen coordinates). Done once here so both activation steps below can trust it.
-            if (WindowFromPoint(screenPoint) != terminalHandle)
+            // same screen coordinates). Child windows of the terminal count as the terminal.
+            IntPtr hwndAtPoint = WindowFromPoint(screenPoint);
+            if (hwndAtPoint != terminalHandle &&
+                (hwndAtPoint == IntPtr.Zero || !IsChild(terminalHandle, hwndAtPoint)))
             {
                 return;
             }
 
-            if (_settings == null || !_settings.DisableBringToForeground)
+            BringVisualStudioToForegroundIfNeeded();
+            bool paneNeedsActivation = !IsTerminalToolWindowActive();
+            int clickSequence = _terminalClickSequence;
+            IntPtr vsRootWindow = GetAncestor(terminalHandle, GA_ROOT);
+
+#pragma warning disable VSSDK007 // Fire-and-forget is intentional here
+            _ = ThreadHelper.JoinableTaskFactory.RunAsync(async () =>
             {
-                BringVisualStudioToForegroundIfNeeded();
+                if (paneNeedsActivation)
+                {
+                    await ActivateTerminalToolWindowAsync();
+                }
+
+                await EnsureTerminalFocusAfterClickAsync(clickSequence, vsRootWindow);
+            });
+#pragma warning restore VSSDK007
+        }
+
+        /// <summary>
+        /// Focus guard for a click on the embedded terminal (issue #74): checks every 80ms for
+        /// ~1.6s that native keyboard focus is on the terminal and re-asserts it when VS's
+        /// activation shuffle has moved it elsewhere. Bails out immediately when the user clicks
+        /// again anywhere (a newer click owns focus now), switches to another application, or the
+        /// terminal goes away — so it cannot fight the user, only VS's deferred focus restores.
+        /// Ordinary clicks cost one cheap GetFocus check per tick and no asserts.
+        /// </summary>
+        private async Task EnsureTerminalFocusAfterClickAsync(int clickSequence, IntPtr vsRootWindow)
+        {
+            const int checkIntervalMs = 80;
+            const int totalChecks = 20; // ~1.6s of guarding
+
+            for (int check = 0; check < totalChecks; check++)
+            {
+                await Task.Delay(checkIntervalMs);
+                await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+
+                // A newer click (terminal or not) supersedes this guard.
+                if (clickSequence != _terminalClickSequence)
+                {
+                    return;
+                }
+
+                if (terminalHandle == IntPtr.Zero || !IsWindow(terminalHandle))
+                {
+                    return;
+                }
+
+                // The user moved to another application — leave focus alone.
+                if (vsRootWindow != IntPtr.Zero && GetForegroundWindow() != vsRootWindow)
+                {
+                    return;
+                }
+
+                var panel = ActiveTerminalPanel;
+                if (panel == null || panel.IsDisposed)
+                {
+                    return;
+                }
+
+                if (!IsTerminalFocused())
+                {
+                    FocusTerminalPanel(panel);
+                }
             }
-            ActivateTerminalToolWindowIfNeeded();
         }
 
         /// <summary>
         /// Brings the VS top-level window to the front of the Win32 Z-order if it isn't already.
         /// Uses AttachThreadInput to bypass Windows' focus-stealing protection so the activation
         /// works even when another application currently owns the foreground.
+        /// Returns true when it actually activated VS (so the caller knows keyboard focus moved).
         /// </summary>
-        private void BringVisualStudioToForegroundIfNeeded()
+        private bool BringVisualStudioToForegroundIfNeeded()
         {
             IntPtr foreground = GetForegroundWindow();
             if (foreground == terminalHandle)
             {
-                return;
+                return false;
             }
 
             IntPtr root = GetAncestor(terminalHandle, GA_ROOT);
             if (root == IntPtr.Zero || !IsWindow(root) || foreground == root)
             {
-                return;
+                return false;
             }
 
             // Plain SetForegroundWindow is denied when our process isn't the foreground app,
@@ -2171,26 +2601,8 @@ namespace ClaudeCodeVS
                     AttachThreadInput(currentThreadId, foregroundThreadId, false);
                 }
             }
-        }
 
-        /// <summary>
-        /// Marks the embedded terminal's tool window as the active pane inside VS, if it isn't already.
-        /// </summary>
-        private void ActivateTerminalToolWindowIfNeeded()
-        {
-            ThreadHelper.ThrowIfNotOnUIThread();
-
-            if (IsTerminalToolWindowActive())
-            {
-                return;
-            }
-
-#pragma warning disable VSSDK007 // Fire-and-forget is intentional here
-            _ = ThreadHelper.JoinableTaskFactory.RunAsync(async () =>
-            {
-                await ActivateTerminalToolWindowAsync();
-            });
-#pragma warning restore VSSDK007
+            return true;
         }
 
         /// <summary>
@@ -2307,6 +2719,47 @@ namespace ClaudeCodeVS
             {
                 uint message = unchecked((uint)wParam.ToInt64());
 
+                // Command Prompt (conhost) Ctrl+Scroll zoom (issue #76/#78): change the console font
+                // size directly via SetCurrentConsoleFontEx instead of relying on the mouse wheel.
+                // Neither the physical wheel nor a posted WM_MOUSEWHEEL reaches conhost's own zoom when
+                // a TUI has put the console into mouse-input mode (QuickEdit off) — conhost forwards
+                // the wheel to the app, which ignores it. Setting the font is independent of console
+                // input mode, so zoom works whether the agent's TUI is up or not. The physical event
+                // is consumed so the zoom is never applied twice when QuickEdit is on. Windows Terminal
+                // is left on its native path (it isn't conhost and doesn't have this problem).
+                if (message == WM_MOUSEWHEEL
+                    && _wtTabBarHeight == 0
+                    && (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0)
+                {
+                    var wheelInfo = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(MSLLHOOKSTRUCT));
+                    if (TryForwardConhostCtrlZoom(wheelInfo))
+                    {
+                        // Consume so conhost doesn't also process the physical wheel (double zoom).
+                        return (IntPtr)1;
+                    }
+                }
+
+                // Command Prompt (conhost) right-click paste (issue #78): when the agent's TUI has
+                // put the console into mouse-input mode (QuickEdit off), conhost forwards the
+                // right-click to the app instead of pasting the clipboard, so native right-click
+                // paste silently does nothing. Detect that state and paste via keystrokes instead,
+                // consuming both the down and the matching up so the agent doesn't also see a click.
+                // In normal (QuickEdit on) mode we don't touch it — conhost's native paste works.
+                if (message == WM_RBUTTONDOWN && _wtTabBarHeight == 0)
+                {
+                    var rInfo = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(MSLLHOOKSTRUCT));
+                    if (TryConhostRightClickPaste(rInfo))
+                    {
+                        _consumeNextRButtonUp = true;
+                        return (IntPtr)1;
+                    }
+                }
+                else if (message == WM_RBUTTONUP && _consumeNextRButtonUp)
+                {
+                    _consumeNextRButtonUp = false;
+                    return (IntPtr)1;
+                }
+
                 // This runs on the dedicated hook thread, not the UI thread. All the actual
                 // handling touches WPF/WinForms state, so marshal it to the UI thread without
                 // blocking this callback. A cheap inline filter keeps us from flooding the
@@ -2329,6 +2782,107 @@ namespace ClaudeCodeVS
             }
 
             return CallNextHookEx(_mouseHookHandle, nCode, wParam, lParam);
+        }
+
+        /// <summary>
+        /// Zooms the embedded Command Prompt (conhost) by changing its console font size directly
+        /// when the cursor is over it, and records the zoom delta for replay. Used so Ctrl+Scroll
+        /// zoom keeps working even when a TUI has put the console into mouse-input mode (QuickEdit
+        /// off), in which conhost ignores both the physical wheel and a posted WM_MOUSEWHEEL
+        /// (issue #76/#78). Runs on the mouse-hook thread, so the hit test is a Win32 GetWindowRect
+        /// check (no WPF/WinForms access); the font change (which briefly attaches to the agent's
+        /// console) is offloaded to a background task and the settings/refresh work is marshaled to
+        /// the UI thread. Returns true when the gesture targets the terminal and should be consumed
+        /// by the caller — even before the async font change completes — so conhost never also
+        /// processes the physical wheel (double zoom when QuickEdit is on).
+        /// </summary>
+        private bool TryForwardConhostCtrlZoom(MSLLHOOKSTRUCT info)
+        {
+            IntPtr handle = terminalHandle;
+            if (handle == IntPtr.Zero || !IsWindow(handle)) return false;
+
+            // Hook-thread-safe hit test: is the cursor over the embedded terminal window?
+            if (!GetWindowRect(handle, out RECT rect)) return false;
+            if (info.pt.x < rect.Left || info.pt.x >= rect.Right ||
+                info.pt.y < rect.Top || info.pt.y >= rect.Bottom)
+            {
+                return false;
+            }
+
+            int wheelDelta = (short)((info.mouseData >> 16) & 0xFFFF);
+            if (wheelDelta == 0) return false;
+
+            int step = wheelDelta > 0 ? 1 : -1;
+
+            // Apply the font change off the hook thread (AttachConsole is too heavy for a low-level
+            // hook callback), then persist the delta (for restart replay) and run the deferred
+            // repaint passes on the UI thread, mirroring the native Ctrl+Scroll handling.
+            try
+            {
+#pragma warning disable VSTHRD110
+                _ = Task.Run(async () =>
+                {
+                    bool applied = TryAdjustConhostFontSize(step);
+                    if (!applied) return;
+
+                    await ThreadHelper.JoinableTaskFactory.SwitchToMainThreadAsync();
+                    if (_settings == null) return;
+                    _settings.TerminalZoomDelta += step;
+                    _zoomSaveTimer?.Stop();
+                    _zoomSaveTimer?.Start();
+                    ScheduleManualZoomRefresh();
+                });
+#pragma warning restore VSTHRD110
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"TryForwardConhostCtrlZoom dispatch error: {ex.Message}");
+            }
+
+            return true;
+        }
+
+        // Set when a right-click-down over the conhost terminal was consumed for a keystroke paste,
+        // so the matching right-click-up is consumed too and the agent never sees a stray click.
+        private bool _consumeNextRButtonUp;
+
+        /// <summary>
+        /// Handles a right-click over the embedded Command Prompt (conhost) as a paste when the
+        /// console is in mouse-input mode (QuickEdit off), in which conhost forwards the click to the
+        /// running TUI instead of pasting the clipboard (issue #78). Runs on the mouse-hook thread:
+        /// the hit test is a Win32 GetWindowRect check and the mouse-mode probe is a short AttachConsole
+        /// round-trip (acceptable for a one-off click, unlike the high-frequency wheel). When in
+        /// mouse-input mode it kicks off a keystroke paste of the clipboard text and returns true so
+        /// the caller consumes the click; otherwise returns false to let conhost's native paste run.
+        /// </summary>
+        private bool TryConhostRightClickPaste(MSLLHOOKSTRUCT info)
+        {
+            IntPtr handle = terminalHandle;
+            if (handle == IntPtr.Zero || !IsWindow(handle)) return false;
+
+            // Hook-thread-safe hit test: is the cursor over the embedded terminal window?
+            if (!GetWindowRect(handle, out RECT rect)) return false;
+            if (info.pt.x < rect.Left || info.pt.x >= rect.Right ||
+                info.pt.y < rect.Top || info.pt.y >= rect.Bottom)
+            {
+                return false;
+            }
+
+            // Only intervene when QuickEdit is off — otherwise conhost's own right-click paste works.
+            if (!IsTerminalInMouseInputMode()) return false;
+
+            try
+            {
+#pragma warning disable VSTHRD110
+                _ = PasteClipboardToTerminalViaKeystrokesAsync();
+#pragma warning restore VSTHRD110
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"TryConhostRightClickPaste dispatch error: {ex.Message}");
+            }
+
+            return true;
         }
 
         /// <summary>
@@ -2377,6 +2931,9 @@ namespace ClaudeCodeVS
             }
             else if (message == WM_LBUTTONDOWN)
             {
+                // Every click (anywhere) invalidates the focus guard of the previous
+                // terminal click — increment before starting this click's guard.
+                _terminalClickSequence++;
                 ActivateEmbeddedTerminalOnClick(info.pt);
                 BeginWindowsTerminalSelectionTracking(info.pt);
             }
@@ -2513,14 +3070,20 @@ namespace ClaudeCodeVS
         /// </summary>
         private static async Task<IntPtr> FindMainWindowHandleByConhostAsync(
             int conhostPid, int timeoutMs = 5000, int pollIntervalMs = 50,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default, Process launcherProcess = null)
         {
             var sw = Stopwatch.StartNew();
             var targetPids = new HashSet<uint> { (uint)conhostPid };
+            var className = new System.Text.StringBuilder(256);
 
             while (sw.ElapsedMilliseconds < timeoutMs)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+
+                // The launcher died — its console window will never appear, so let the caller
+                // react (retry the spawn) instead of polling out the full timeout (issue #73).
+                if (launcherProcess != null && HasTerminalProcessExited(launcherProcess))
+                    return IntPtr.Zero;
 
                 // Refresh child PIDs each iteration using ToolHelp32 snapshot (sub-ms, no WMI).
                 // GetWindowThreadProcessId returns the console client's PID (cmd.exe), not conhost's
@@ -2532,13 +3095,21 @@ namespace ClaudeCodeVS
                 EnumWindows((hWnd, lParam) =>
                 {
                     GetWindowThreadProcessId(hWnd, out uint pid);
-                    if (targetPids.Contains(pid))
-                    {
-                        found = hWnd;
-                        ShowWindow(hWnd, SW_HIDE);
-                        return false;
-                    }
-                    return true;
+                    if (!targetPids.Contains(pid))
+                        return true;
+
+                    // A matching PID alone is not enough: other top-level windows can report
+                    // these PIDs too (e.g. the conhost thread's invisible "Default IME" window).
+                    // Embedding one of those leaves the panel blank while the real console
+                    // window stays floating (issue #73) — accept only the console window class.
+                    className.Length = 0;
+                    GetClassName(hWnd, className, className.Capacity);
+                    if (!string.Equals(className.ToString(), "ConsoleWindowClass", StringComparison.Ordinal))
+                        return true;
+
+                    found = hWnd;
+                    ShowWindow(hWnd, SW_HIDE);
+                    return false;
                 }, IntPtr.Zero);
 
                 if (found != IntPtr.Zero)
@@ -2547,6 +3118,115 @@ namespace ClaudeCodeVS
                 await Task.Delay(pollIntervalMs, cancellationToken);
             }
             return IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// Makes sure the WinForms panel that hosts the embedded terminal exists and has a live
+        /// Win32 handle, recreating it when it is missing or disposed. The panel can die when its
+        /// WindowsFormsHost tears down — before this guard the launch silently bailed out, and
+        /// because the dead panel persisted, every subsequent "Restart code agent" stayed blank
+        /// until the project was reopened (issue #73). Must run on the UI thread. Returns false
+        /// only when there is no TerminalHost left to attach a panel to.
+        /// </summary>
+        private bool EnsureTerminalPanelReady()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            try
+            {
+                if (terminalPanel != null && !terminalPanel.IsDisposed && terminalPanel.Handle != IntPtr.Zero)
+                {
+                    return true;
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+                // Disposed between the checks — fall through and recreate.
+            }
+
+            if (TerminalHost == null)
+            {
+                LogTerminalLaunch("terminal panel unavailable and TerminalHost is null — cannot recreate");
+                return false;
+            }
+
+            LogTerminalLaunch($"terminal panel {(terminalPanel == null ? "missing" : "dead")} — recreating before embed");
+            terminalPanel = new System.Windows.Forms.Panel
+            {
+                Dock = System.Windows.Forms.DockStyle.Fill,
+                BackColor = GetTerminalBackgroundColor()
+            };
+            TerminalHost.Child = terminalPanel;
+            terminalPanel.Resize += (s, e) => ResizeEmbeddedTerminal();
+
+            return terminalPanel.Handle != IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// True when there is still terminal state to manage, even if the embedded window was
+        /// not found. Workspace events use this instead of cmdProcess == null so they do not
+        /// launch a second terminal while a previous launch is still running or being retried.
+        /// </summary>
+        private bool HasTerminalLaunchState()
+        {
+            if (terminalHandle != IntPtr.Zero && IsWindow(terminalHandle))
+            {
+                return true;
+            }
+
+            if (cmdProcess == null)
+            {
+                return false;
+            }
+
+            return !HasTerminalProcessExited(cmdProcess);
+        }
+
+        /// <summary>
+        /// True when the terminal launcher process has exited (or its state can no longer be read).
+        /// </summary>
+        private static bool HasTerminalProcessExited(Process process)
+        {
+            try { return process.HasExited; }
+            catch { return true; }
+        }
+
+        /// <summary>
+        /// Path of the terminal-launch diagnostic log. Debug.WriteLine is compiled out of Release
+        /// builds, so launch failures on user machines (issue #73) were impossible to diagnose
+        /// remotely — this small rolling log is what users attach to bug reports.
+        /// </summary>
+        private static string TerminalLaunchLogPath =>
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                         "ClaudeCodeExtension", "terminal-launch.log");
+
+        private static readonly object _terminalLaunchLogLock = new object();
+
+        /// <summary>
+        /// Appends a timestamped line to the terminal-launch diagnostic log. Must never throw —
+        /// diagnostics cannot be allowed to break the launch path. The file is reset once it
+        /// grows past 512 KB so it can be left enabled permanently.
+        /// </summary>
+        private static void LogTerminalLaunch(string message)
+        {
+            try
+            {
+                lock (_terminalLaunchLogLock)
+                {
+                    string path = TerminalLaunchLogPath;
+                    Directory.CreateDirectory(Path.GetDirectoryName(path));
+                    var info = new FileInfo(path);
+                    if (info.Exists && info.Length > 512 * 1024)
+                    {
+                        info.Delete();
+                    }
+                    File.AppendAllText(path, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff") + "  " + message + Environment.NewLine);
+                }
+            }
+            catch
+            {
+                // Swallow everything — logging is best-effort only.
+            }
         }
 
         /// <summary>
@@ -3025,6 +3705,10 @@ namespace ClaudeCodeVS
                 }
             }
 
+            // A user-configured custom path overrides native/PATH resolution.
+            baseCommand = ResolveProviderExecutable(
+                isWsl ? AiProvider.ClaudeCodeWSL : AiProvider.ClaudeCode, baseCommand, isWsl);
+
             if (_settings?.ClaudeDangerouslySkipPermissions == true)
             {
                 baseCommand = $"{baseCommand} --dangerously-skip-permissions";
@@ -3055,7 +3739,8 @@ namespace ClaudeCodeVS
         /// <returns>The codex command to execute</returns>
         private string GetCodexCommand(bool isWsl = false)
         {
-            string baseCommand = "codex";
+            string baseCommand = ResolveProviderExecutable(
+                isWsl ? AiProvider.Codex : AiProvider.CodexNative, "codex", isWsl);
 
             if (_settings?.CodexFullAuto == true)
             {
@@ -3072,7 +3757,7 @@ namespace ClaudeCodeVS
         /// <returns>The devin command to execute</returns>
         private string GetWindsurfCommand()
         {
-            string baseCommand = "devin";
+            string baseCommand = ResolveProviderExecutable(AiProvider.Windsurf, "devin", isWsl: true);
 
             if (_settings?.WindsurfDangerousMode == true)
             {
@@ -3089,7 +3774,7 @@ namespace ClaudeCodeVS
         /// <returns>The agy command to execute</returns>
         private string GetAntigravityCommand()
         {
-            string baseCommand = "agy";
+            string baseCommand = ResolveProviderExecutable(AiProvider.Antigravity, "agy");
 
             if (_settings?.AntigravityDangerouslySkipPermissions == true)
             {
@@ -3153,6 +3838,9 @@ namespace ClaudeCodeVS
 
             string baseCommand = File.Exists(nativeAgentPath) ? $"\"{nativeAgentPath}\"" : "agent";
 
+            // A user-configured custom path overrides native/PATH resolution.
+            baseCommand = ResolveProviderExecutable(AiProvider.CursorAgentNative, baseCommand);
+
             if (_settings?.CursorAgentAutoRun == true)
             {
                 return $"{baseCommand} --yolo";
@@ -3168,12 +3856,14 @@ namespace ClaudeCodeVS
         /// <returns>The cursor-agent command to execute in WSL</returns>
         private string GetCursorAgentWslCommand()
         {
+            string baseCommand = ResolveProviderExecutable(AiProvider.CursorAgent, "cursor-agent", isWsl: true);
+
             if (_settings?.CursorAgentAutoRun == true)
             {
-                return "cursor-agent --yolo";
+                return $"{baseCommand} --yolo";
             }
 
-            return "cursor-agent";
+            return baseCommand;
         }
 
 

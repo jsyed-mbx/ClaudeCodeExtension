@@ -53,6 +53,8 @@ namespace ClaudeCodeVS
         private const uint WM_MOUSEMOVE = 0x0200;
         private const uint WM_LBUTTONDOWN = 0x0201;
         private const uint WM_LBUTTONUP = 0x0202;
+        private const uint WM_RBUTTONDOWN = 0x0204;
+        private const uint WM_RBUTTONUP = 0x0205;
         private const uint WM_MOUSEWHEEL = 0x020A;
 
         // GetAncestor flags
@@ -143,6 +145,12 @@ namespace ClaudeCodeVS
         /// </summary>
         [DllImport("user32.dll", SetLastError = true)]
         private static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
+
+        /// <summary>
+        /// Returns the parent window of the specified window, or IntPtr.Zero for top-level windows
+        /// </summary>
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetParent(IntPtr hWnd);
 
         /// <summary>
         /// Changes the size and position of a window
@@ -306,9 +314,11 @@ namespace ClaudeCodeVS
         private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
 
         /// <summary>
-        /// Posts a message to the message queue of a window
+        /// Posts a message to the message queue of a window.
+        /// CharSet.Unicode binds PostMessageW so WM_CHAR carries the full UTF-16 code unit
+        /// (issue #79 - CJK/non-ASCII input was garbled through the default ANSI PostMessageA).
         /// </summary>
-        [DllImport("user32.dll")]
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
         /// <summary>
@@ -417,6 +427,24 @@ namespace ClaudeCodeVS
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool FreeConsole();
 
+        /// <summary>
+        /// Returns the window handle of the console attached to the calling process, or IntPtr.Zero when none
+        /// </summary>
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr GetConsoleWindow();
+
+        // ---- Standard-handle hygiene (used by the "On Agent Finish" console capture) ----
+        // AttachConsole REPLACES the calling process's standard handles with handles to the
+        // attached console, and FreeConsole does NOT restore them — they stay dangling after
+        // detach. These let the capture snapshot and put back the original values.
+
+        private const int STD_INPUT_HANDLE = -10;
+        private const int STD_ERROR_HANDLE = -12;
+        // STD_OUTPUT_HANDLE (-11) and GetStdHandle are declared further down in this file.
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetStdHandle(int nStdHandle, IntPtr hHandle);
+
         // ---- Console screen-buffer reading (used by the "On Agent Finish" idle detector) ----
 
         private const uint GENERIC_READ_CONSOLE = 0x80000000;
@@ -479,6 +507,22 @@ namespace ClaudeCodeVS
         /// </summary>
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool GetConsoleScreenBufferInfo(IntPtr hConsoleOutput, out CONSOLE_SCREEN_BUFFER_INFO lpConsoleScreenBufferInfo);
+
+        /// <summary>
+        /// Retrieves the current input/output mode of a console handle. Used on the input handle
+        /// (CONIN$) to detect when a TUI has put the embedded conhost into mouse-input mode
+        /// (ENABLE_QUICK_EDIT_MODE cleared), in which conhost's own right-click paste and
+        /// Ctrl+Scroll zoom are intercepted by the running app (issue #76).
+        /// </summary>
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+
+        /// <summary>
+        /// Console input-mode flag: when set, the console is in QuickEdit mode (mouse selects text,
+        /// right-click pastes, Ctrl+Scroll zooms). A TUI that needs mouse events clears it (turning
+        /// ENABLE_MOUSE_INPUT on), which is the state that breaks conhost paste/zoom in issue #76.
+        /// </summary>
+        private const uint ENABLE_QUICK_EDIT_MODE = 0x0040;
 
         /// <summary>
         /// Copies a number of characters from consecutive cells of a console screen buffer.
